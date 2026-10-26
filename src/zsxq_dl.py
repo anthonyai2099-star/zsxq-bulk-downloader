@@ -153,11 +153,31 @@ def launch(pw, headless: bool = False) -> tuple[BrowserContext, Page]:
     raise SystemExit("无法启动浏览器：\n  " + "\n  ".join(errors))
 
 
+def wait_for_app_ready(page: Page, timeout_s: int = 30) -> None:
+    """首页是 SPA，domcontentloaded 后还要等 JS 渲染或跳转 /login。"""
+    try:
+        page.wait_for_load_state("networkidle", timeout=timeout_s * 1_000)
+    except PWTimeout:
+        pass
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if "/login" in page.url.lower():
+            return
+        try:
+            body = page.inner_text("body", timeout=2_000)
+        except PWTimeout:
+            body = ""
+        if len(body.strip()) > 20:
+            return
+        page.wait_for_timeout(500)
+
+
 def on_zsxq(page: Page) -> Page:
     """打开知识星球首页；首次导航偶发 ERR_ABORTED，换新页重试一次。"""
     for attempt in (1, 2):
         try:
             page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60_000)
+            wait_for_app_ready(page)
             return page
         except PWError:
             if attempt == 2:
@@ -167,24 +187,41 @@ def on_zsxq(page: Page) -> Page:
 
 
 def looks_logged_out(page: Page) -> bool:
+    """未登录时网站会跳转到 /login；页面刚加载完 body 可能为空，所以先看 URL。"""
+    if "/login" in page.url.lower():
+        return True
     try:
         body = page.inner_text("body", timeout=5_000)
     except PWTimeout:
         return False
-    return bool(re.search(r"扫码登录|登录知识星球|微信登录", body))
+    return bool(re.search(r"登录知识星球|获取登录二维码|扫码登录", body))
 
 
-def wait_for_login(page: Page, timeout_s: int = 300) -> None:
+def hint_login(page: Page) -> None:
+    """登录页是纯前端流程（勾协议 -> 确认弹窗 -> 获取二维码），交给用户手点最稳。"""
+    log("浏览器已停在知识星球登录页，请手动完成：")
+    log("  1. 勾选「我已阅读并同意」→ 弹窗点「同意」")
+    log("  2. 点「获取登录二维码」，用微信扫码")
+    try:
+        page.bring_to_front()
+    except PWError:
+        pass
+
+
+def wait_for_login(page: Page, timeout_s: int = 600) -> None:
     if not looks_logged_out(page):
         return
-    log("检测到未登录，请在浏览器窗口里完成登录……")
+    log("检测到未登录。")
+    hint_login(page)
+    log("请用微信扫码登录（二维码在浏览器窗口里），脚本会自动等待……")
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        time.sleep(2)
+        page.wait_for_timeout(2_000)
         if not looks_logged_out(page):
             log("登录成功，继续。")
+            page.wait_for_timeout(2_000)
             return
-    raise SystemExit("等待登录超时，请重新运行并先手动登录。")
+    raise SystemExit("等待登录超时，请重新运行 `login`。")
 
 
 def open_group(page: Page, group: str | None, group_url: str | None) -> None:
@@ -319,19 +356,18 @@ def cmd_login(args: argparse.Namespace) -> int:
     with sync_playwright() as pw:
         ctx, page = launch(pw, headless=False)
         page = on_zsxq(page)
-        page.wait_for_timeout(2_000)
+        page.wait_for_timeout(2_500)
         if looks_logged_out(page):
-            log("未登录。请在弹出的浏览器窗口里扫码登录，脚本会自动等待。")
-            if sys.stdin.isatty():
-                input("登录完成后按 Enter 继续……")
-            else:
-                deadline = time.time() + args.wait
-                while time.time() < deadline and looks_logged_out(page):
-                    page.wait_for_timeout(2_000)
-                if looks_logged_out(page):
-                    log(f"等了 {args.wait}s 仍未检测到登录，先退出。")
-                    ctx.close()
-                    return 1
+            log("未登录，已打开登录页。")
+            hint_login(page)
+            log("请用微信扫码登录（二维码在浏览器窗口里），脚本会自动等待……")
+            deadline = time.time() + args.wait
+            while time.time() < deadline and looks_logged_out(page):
+                page.wait_for_timeout(2_000)
+            if looks_logged_out(page):
+                log(f"等了 {args.wait}s 仍未检测到登录，先退出。")
+                ctx.close()
+                return 1
             log("检测到已登录，保存登录态。")
         else:
             log("当前已是登录状态。")
@@ -458,7 +494,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_login = sub.add_parser("login", help="打开浏览器手动登录，保存登录态")
-    p_login.add_argument("--wait", type=int, default=300, help="非交互模式下等待登录的秒数")
+    p_login.add_argument("--wait", type=int, default=600, help="等待扫码登录的秒数")
     p_login.set_defaults(func=cmd_login)
 
     p_probe = sub.add_parser("probe", help="导出当前页面结构，用于校准选择器")

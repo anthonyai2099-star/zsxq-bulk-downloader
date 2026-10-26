@@ -360,11 +360,16 @@ def cmd_login(args: argparse.Namespace) -> int:
         if looks_logged_out(page):
             log("未登录，已打开登录页。")
             hint_login(page)
-            log("请用微信扫码登录（二维码在浏览器窗口里），脚本会自动等待……")
+            log(f"脚本会等待 {args.wait}s，期间扫码即可，扫完自动继续……")
             deadline = time.time() + args.wait
-            while time.time() < deadline and looks_logged_out(page):
-                page.wait_for_timeout(2_000)
-            if looks_logged_out(page):
+            try:
+                while time.time() < deadline and looks_logged_out(page):
+                    page.wait_for_timeout(2_000)
+                timed_out = looks_logged_out(page)
+            except PWError as exc:  # 用户手动关了窗口
+                log(f"浏览器窗口已关闭（{str(exc).splitlines()[0]}）。")
+                return 1
+            if timed_out:
                 log(f"等了 {args.wait}s 仍未检测到登录，先退出。")
                 ctx.close()
                 return 1

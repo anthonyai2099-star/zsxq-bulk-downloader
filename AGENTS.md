@@ -19,7 +19,12 @@ python -m venv .venv
 
 ## 关键约定
 
-- `.browser-profile/` 存登录态，**不进 git**；`probe/`、`.tmp/`、下载产物同样忽略。
+- **长期库固定在 `D:\知识星球下载\<群组>\`**；导出先落工作区暂存区
+  `D:\CLAUDE-CODE\Text\_exports\zsxq\<群组>\`，跑完用 `scripts\sync-to-d.ps1` 搬过去并合并 `_manifest.json`。
+- **增量下载**：扩大时间范围时（30 天→60 天）只改 `--days`，并加
+  `--existing "D:\知识星球下载\<群组>"`，已下载文件按「帖子文件夹 + 文件名」自动跳过，不许重复下载。
+- Python 子进程只能写工作区，直接写 `D:\知识星球下载` 会 `PermissionError`，不要试图绕过（junction 也会被拦）。
+- `.browser-profile/` 存登录态，**不进 git**；`probe/`、`.tmp/`、`.venv/`、`downloads/` 同样忽略。
 - 页面结构变化时先跑 `probe` 导出 HTML/JSON，再改 `src/zsxq_dl.py` 顶部的 `FILE_SELECTOR` / `DOWNLOAD_SELECTOR`。
 - 切群组必须按 group_id 导航 URL，点侧栏群组名不会刷新信息流。
 - 不要改走 `api.zsxq.com`：官方明确拦截非官方工具（code 1059）。

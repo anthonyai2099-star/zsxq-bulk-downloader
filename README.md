@@ -79,8 +79,28 @@ downloads/系统技术/
 | `--retries N` | 单个文件最多重试次数（默认 2） |
 | `--delay` | 每个文件之间的间隔秒数 |
 | `--out DIR` | 根目录，默认 `downloads/` |
+| `--existing DIR` | 已下载目录，命中同名文件就跳过（可重复，增量补跑用） |
 
-**为什么默认不直接写 `~/Downloads`**：本机沙箱下 Python 子进程只能写工作区，写 `C:\Users\...\Downloads` 会 `PermissionError`。先落到项目 `downloads/`，再用 PowerShell 搬走即可（我这边就是这么做的）。
+## 长期存放与增量下载（重要约定）
+
+**长期库固定在 `D:\知识星球下载\<群组名>\`**，这是唯一需要备份的地方。
+
+Python 子进程被沙箱限制只能写工作区，写 `D:\知识星球下载` 会 `PermissionError`，所以流程是「先落暂存区，再搬过去」：
+
+```powershell
+# 1. 导出到工作区暂存区，同时告诉它去哪儿找已下载的文件
+.\.venv\Scripts\python.exe src\zsxq_dl.py export `
+  --group "系统技术" --days 30 --folder-name "系统技术" `
+  --out "D:\CLAUDE-CODE\Text\_exports\zsxq" `
+  --existing "D:\知识星球下载\系统技术"
+
+# 2. 搬到 D 盘长期库，并合并清单
+pwsh -File scripts\sync-to-d.ps1
+```
+
+**增量规则**：任何时候要更大范围（比如这次 30 天、下次 60 天），都只要把 `--days` 改大、`--existing` 指向长期库即可，已经下过的文件按「帖子文件夹 + 文件名」自动跳过，不会重复下载。
+
+> 路径别名：暂存区 `D:\CLAUDE-CODE\Text\_exports\zsxq\<群组>`、长期库 `D:\知识星球下载\<群组>`。别把 C 盘的临时副本当作库，C 盘那份只是给用户看一眼的拷贝。
 
 ## 真实页面结构（2026-10 校准）
 

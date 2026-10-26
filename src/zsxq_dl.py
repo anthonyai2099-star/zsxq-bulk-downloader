@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """知识星球附件批量下载器（Playwright 本地版）。
 
 把 zsxq-pdf-downloader 技能的流程，从「Claude in Chrome 扩展手动点」改成本机脚本：
@@ -672,6 +672,13 @@ def find_post(posts: list[dict], key: tuple) -> dict | None:
     return None
 
 
+def already_have(folder_name: str, filename: str, root: Path, existing_roots: list[Path]) -> bool:
+    """目标目录或任意 --existing 目录里已有同名文件，就认为下过了。"""
+    if (root / folder_name / filename).exists():
+        return True
+    return any((base / folder_name / filename).exists() for base in existing_roots)
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     """按帖子导出：每篇一个文件夹，里面只放附件。
 
@@ -686,6 +693,9 @@ def cmd_export(args: argparse.Namespace) -> int:
     root = Path(args.out).expanduser() / (args.folder_name or args.group or args.group_id or "zsxq")
     root.mkdir(parents=True, exist_ok=True)
     log(f"输出目录：{root}")
+    existing_roots = [Path(e).expanduser() for e in args.existing]
+    if existing_roots:
+        log("已存在目录（命中则跳过）：" + "、".join(str(r) for r in existing_roots))
 
     used_names: set[str] = set()
     done, skipped, failed = 0, 0, 0
@@ -732,8 +742,7 @@ def cmd_export(args: argparse.Namespace) -> int:
         while pending:
             key, folder, name, tries = pending.pop(0)
             index += 1
-            target = folder / sanitize(name)
-            if target.exists() and not args.force:
+            if not args.force and already_have(folder.name, sanitize(name), root, existing_roots):
                 skipped += 1
                 manifest.append({"folder": folder.name, "name": name, "status": "skipped"})
                 continue
@@ -871,7 +880,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_exp.add_argument("--days", type=int, default=7, help="只处理最近 N 天（默认 7）")
     p_exp.add_argument("--since", help="起始日期 YYYY-MM-DD，优先于 --days")
     p_exp.add_argument("--ext", default="*", help="附件类型过滤，默认 * 全部")
-    p_exp.add_argument("--out", default=str(DEFAULT_OUT), help="根目录（默认 ~/Downloads/zsxq）")
+    p_exp.add_argument("--out", default=str(DEFAULT_OUT), help="根目录（默认 downloads/）")
+    p_exp.add_argument("--existing", action="append", default=[],
+                       help="已下载的目录，命中同名文件则跳过（可重复，用于增量补跑）")
     p_exp.add_argument("--folder-name", help="群组子目录名，默认用群组名")
     p_exp.add_argument("--max-scrolls", type=int, default=60, help="最多滚动多少批")
     p_exp.add_argument("--pause", type=float, default=2.0, help="每批等待秒数")

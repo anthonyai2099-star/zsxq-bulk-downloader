@@ -28,7 +28,8 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:  # noqa: BLE001 - 被重定向或老版本时忽略
         pass
 
-from playwright.sync_api import BrowserContext, Page, TimeoutError as PWTimeout
+from playwright.sync_api import BrowserContext, Error as PWError, Page
+from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -138,7 +139,13 @@ def launch(pw, headless: bool = False) -> tuple[BrowserContext, Page]:
             if channel:
                 kwargs["channel"] = channel
             ctx = pw.chromium.launch_persistent_context(**kwargs)
-            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            # 关闭浏览器自带的启动页，统一用新页：Edge 首启页面会被替换，导致导航 ERR_ABORTED
+            for old in list(ctx.pages):
+                try:
+                    old.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            page = ctx.new_page()
             log(f"浏览器已启动（{channel or 'chromium'}），profile: {PROFILE_DIR}")
             return ctx, page
         except Exception as exc:  # noqa: BLE001 - 依次尝试各浏览器
@@ -146,8 +153,17 @@ def launch(pw, headless: bool = False) -> tuple[BrowserContext, Page]:
     raise SystemExit("无法启动浏览器：\n  " + "\n  ".join(errors))
 
 
-def on_zsxq(page: Page) -> None:
-    page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60_000)
+def on_zsxq(page: Page) -> Page:
+    """打开知识星球首页；首次导航偶发 ERR_ABORTED，换新页重试一次。"""
+    for attempt in (1, 2):
+        try:
+            page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60_000)
+            return page
+        except PWError:
+            if attempt == 2:
+                raise
+            page = page.context.new_page()
+    return page
 
 
 def looks_logged_out(page: Page) -> bool:
@@ -302,7 +318,7 @@ def download_one(page: Page, idx: int, name_hint: str, out_dir: Path, timeout_s:
 def cmd_login(args: argparse.Namespace) -> int:
     with sync_playwright() as pw:
         ctx, page = launch(pw, headless=False)
-        on_zsxq(page)
+        page = on_zsxq(page)
         page.wait_for_timeout(2_000)
         if looks_logged_out(page):
             log("未登录。请在弹出的浏览器窗口里扫码登录，脚本会自动等待。")
@@ -328,7 +344,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
     PROBE_DIR.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as ctx_mgr:
         ctx, page = launch(ctx_mgr, headless=False)
-        on_zsxq(page)
+        page = on_zsxq(page)
         page.wait_for_timeout(2_000)
         if looks_logged_out(page):
             log("未登录，请先在浏览器里登录（自动等待）。")
@@ -381,7 +397,7 @@ def cmd_download(args: argparse.Namespace) -> int:
 
     with sync_playwright() as pw:
         ctx, page = launch(pw, headless=False)
-        on_zsxq(page)
+        page = on_zsxq(page)
         page.wait_for_timeout(2_000)
         wait_for_login(page)
 
@@ -486,7 +502,7 @@ def _dry_run(args: argparse.Namespace) -> int:
 
     with sync_playwright() as pw:
         ctx, page = launch(pw, headless=False)
-        on_zsxq(page)
+        page = on_zsxq(page)
         page.wait_for_timeout(2_000)
         wait_for_login(page)
         open_group(page, args.group, args.group_url)

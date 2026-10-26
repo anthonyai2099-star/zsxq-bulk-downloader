@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
-"""知识星球 PDF 批量下载器（Playwright 本地版）。
+"""知识星球附件批量下载器（Playwright 本地版）。
 
-把原技能 SKILL.md 里「靠 Claude in Chrome 扩展手动点」的流程，改成本机可直接跑的脚本：
-用 Playwright 驱动本机 Edge/Chromium（独立 profile，登录一次后长期有效），
-按群组 + 日期范围滚动帖子，逐个点击 PDF 附件并抓取浏览器下载。
+把 zsxq-pdf-downloader 技能的流程，从「Claude in Chrome 扩展手动点」改成本机脚本：
+Playwright 驱动本机 Edge（独立 profile，登录一次长期有效），滚到目标日期范围，
+逐个点击附件卡片 -> 「文件详情」弹窗 -> 「下载文件」，抓取浏览器下载并保存。
+
+真实页面结构（2026-10 校准）：
+  附件卡片     div.file-name            （文字即文件名，点击弹出文件详情）
+  下载按钮     div.btn.download         （弹窗内，文字「下载文件」）
+  群组侧栏     span.group-name
+  帖子时间     "2026-10-26 07:22"
 
 子命令：
-  login    打开浏览器，等用户手动登录知识星球，保存登录态
-  probe    打开浏览器，把当前页面的结构导出到 probe/，用于校准选择器
-  download 按群组/日期批量下载 PDF
+  login    打开浏览器手动登录，保存登录态
+  groups   列出已加入的群组名
+  probe    导出页面结构，页面改版时用来校准选择器
+  download 按群组/日期批量下载附件
 """
 
 from __future__ import annotations
@@ -24,8 +31,8 @@ from pathlib import Path
 
 for _stream in (sys.stdout, sys.stderr):
     try:
-        _stream.reconfigure(encoding="utf-8")  # Windows 控制台默认 GBK，中文会乱码
-    except Exception:  # noqa: BLE001 - 被重定向或老版本时忽略
+        _stream.reconfigure(encoding="utf-8")  # Windows 控制台默认 GBK
+    except Exception:  # noqa: BLE001
         pass
 
 from playwright.sync_api import BrowserContext, Error as PWError, Page
@@ -38,59 +45,55 @@ PROBE_DIR = ROOT / "probe"
 TMP_DIR = ROOT / ".tmp"
 DEFAULT_OUT = Path.home() / "Downloads" / "zsxq"
 HOME_URL = "https://wx.zsxq.com/"
+GROUP_URL = "https://wx.zsxq.com/group/{gid}"
 
-PDF_NAME_RE = re.compile(r"\.pdf\b", re.IGNORECASE)
+FILE_SELECTOR = "div.file-name"
+DOWNLOAD_SELECTOR = "div.btn.download"
+GROUP_NAME_SELECTOR = "span.group-name"
+TAG_ATTR = "data-zsxq-file"
+
 INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
-# 在页面里找出「看起来是 PDF 附件名」的叶子节点，并打上 data-zsxq-dl 标记。
-TAG_PDFS_JS = r"""
+# 给页面上的附件卡片打标记，返回 {idx, text}
+TAG_FILES_JS = r"""
 () => {
   const out = [];
-  const re = /\.pdf\b/i;
-  let idx = 0;
-  const all = document.querySelectorAll('body *');
-  for (const el of all) {
-    if (el.childElementCount !== 0) continue;           // 只取叶子节点
+  document.querySelectorAll('div.file-name').forEach((el, idx) => {
     const t = (el.textContent || '').trim();
-    if (!t || t.length > 180 || !re.test(t)) continue;
-    const r = el.getBoundingClientRect();
-    if (r.width < 1 || r.height < 1) continue;          // 过滤隐藏节点
-    el.setAttribute('data-zsxq-dl', String(idx));
-    out.push({
-      idx: idx,
-      text: t,
-      tag: el.tagName.toLowerCase(),
-      cls: String(el.className || ''),
-      parentCls: String(el.parentElement ? el.parentElement.className : ''),
-    });
-    idx += 1;
-  }
+    el.setAttribute('data-zsxq-file', String(idx));
+    out.push({idx: idx, text: t});
+  });
   return out;
 }
 """
 
-# 收集页面上像日期的小文本，用来判断是否已经滚过目标日期。
+# 收集页面上的时间标签，用于判断是否滚过目标日期
 COLLECT_DATES_JS = r"""
 () => {
   const out = [];
-  const re = /^(?:(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})|(\d{1,2})[-/.](\d{1,2}))$/;
+  const re = /^(?:(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})|(\d{1,2})[-/.](\d{1,2}))(?:\s+\d{1,2}:\d{2})?$/;
   for (const el of document.querySelectorAll('div,span,time,p,a')) {
     if (el.childElementCount !== 0) continue;
     const t = (el.textContent || '').trim();
-    if (!t || t.length > 10) continue;
+    if (!t || t.length > 20) continue;
     if (!re.test(t) && !/^(今天|昨天|前天)$/.test(t)) continue;
-    out.push({
-      text: t,
-      cls: String(el.className || ''),
-      y: Math.round(el.getBoundingClientRect().top + window.scrollY),
-    });
+    out.push({text: t, y: Math.round(el.getBoundingClientRect().top + window.scrollY)});
   }
   return out;
 }
 """
 
-MODAL_TEXT_RE = re.compile(r"下载文件|下载附件")
-PROTECTED_HINTS = ("请在App", "请在 App", "App内查看", "app内查看", "请在APP")
+LIST_GROUPS_JS = r"""
+() => [...document.querySelectorAll('span.group-name')]
+        .map(e => {
+          const name = (e.textContent || '').trim();
+          const link = e.closest('a');
+          const href = link ? (link.getAttribute('href') || '') : '';
+          const m = href.match(/group\/(\d+)/);
+          return {name: name, group_id: m ? m[1] : ''};
+        })
+        .filter(g => g.name)
+"""
 
 
 def log(msg: str) -> None:
@@ -99,7 +102,7 @@ def log(msg: str) -> None:
 
 def sanitize(name: str) -> str:
     name = INVALID_CHARS.sub("_", name).strip().strip(".")
-    return name[:150] or "unnamed.pdf"
+    return name[:150] or "unnamed"
 
 
 def unique_path(path: Path) -> Path:
@@ -114,15 +117,14 @@ def unique_path(path: Path) -> Path:
 
 
 def ensure_temp_dir() -> None:
-    """沙箱环境下系统 TEMP 可能不可写，Playwright 会在 TEMP 下建临时目录导致 EPERM。
-    这里把 TEMP/TMP 指到项目内的 .tmp，保证浏览器能正常启动。"""
+    """沙箱下系统 TEMP 可能不可写，Playwright 建临时目录会 EPERM，指到项目内。"""
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     os.environ["TEMP"] = str(TMP_DIR)
     os.environ["TMP"] = str(TMP_DIR)
 
 
 def launch(pw, headless: bool = False) -> tuple[BrowserContext, Page]:
-    """启动带持久化 profile 的浏览器；优先用本机 Edge，失败再退回 Chromium。"""
+    """启动持久化 profile 的浏览器；优先本机 Edge，失败再退回 Chromium。"""
     ensure_temp_dir()
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     common = dict(
@@ -139,7 +141,6 @@ def launch(pw, headless: bool = False) -> tuple[BrowserContext, Page]:
             if channel:
                 kwargs["channel"] = channel
             ctx = pw.chromium.launch_persistent_context(**kwargs)
-            # 关闭浏览器自带的启动页，统一用新页：Edge 首启页面会被替换，导致导航 ERR_ABORTED
             for old in list(ctx.pages):
                 try:
                     old.close()
@@ -148,7 +149,7 @@ def launch(pw, headless: bool = False) -> tuple[BrowserContext, Page]:
             page = ctx.new_page()
             log(f"浏览器已启动（{channel or 'chromium'}），profile: {PROFILE_DIR}")
             return ctx, page
-        except Exception as exc:  # noqa: BLE001 - 依次尝试各浏览器
+        except Exception as exc:  # noqa: BLE001
             errors.append(f"{channel or 'chromium'}: {exc}")
     raise SystemExit("无法启动浏览器：\n  " + "\n  ".join(errors))
 
@@ -167,48 +168,50 @@ def wait_for_app_ready(page: Page, timeout_s: int = 30) -> None:
             body = page.inner_text("body", timeout=2_000)
         except PWTimeout:
             body = ""
-        if len(body.strip()) > 20:
+        if len(body.strip()) > 50:
             return
         page.wait_for_timeout(500)
 
 
 def on_zsxq(page: Page) -> Page:
-    """打开知识星球首页；首次导航偶发 ERR_ABORTED，换新页重试一次。"""
-    for attempt in (1, 2):
+    """打开首页；导航偶发 ERR_ABORTED / ERR_TIMED_OUT，退避重试。"""
+    last: PWError | None = None
+    for attempt in range(3):
         try:
             page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60_000)
             wait_for_app_ready(page)
             return page
-        except PWError:
-            if attempt == 2:
-                raise
-            page = page.context.new_page()
-    return page
+        except PWError as exc:
+            last = exc
+            if attempt < 2:
+                log(f"打开首页失败（{type(exc).__name__}），{3 * (attempt + 1)}s 后重试……")
+                page.wait_for_timeout(3_000 * (attempt + 1))
+                try:
+                    page = page.context.new_page()
+                except PWError:
+                    pass
+    raise last  # type: ignore[misc]
 
 
 def looks_logged_out(page: Page) -> bool:
-    """判断是否未登录。
-
-    注意：拿不到 body（导航中/inner_text 超时）必须当成「未登录」，
-    否则会被误判成登录成功——之前就是这样误报了两次。
-    """
+    """拿不到 body（导航中/超时）必须当作未登录，否则会误判成登录成功。"""
     url = page.url.lower()
     if "/login" in url:
         return True
-    if "/dweb2" in url:
+    if "/dweb2" in url or "/group/" in url:
         return False
     try:
         body = page.inner_text("body", timeout=6_000)
     except PWTimeout:
         return True
     body = body.strip()
-    if len(body) < 20:
+    if len(body) < 50:
         return True
     return bool(re.search(r"登录知识星球|获取登录二维码|扫码登录", body))
 
 
 def verify_logged_in(page: Page) -> bool:
-    """重新加载首页确认登录态真的生效（cookie 可能没落盘）。"""
+    """重新加载首页，确认登录态真的落盘。"""
     try:
         page.goto(HOME_URL, wait_until="domcontentloaded", timeout=45_000)
         wait_for_app_ready(page, timeout_s=20)
@@ -218,7 +221,6 @@ def verify_logged_in(page: Page) -> bool:
 
 
 def hint_login(page: Page) -> None:
-    """登录页是纯前端流程（勾协议 -> 确认弹窗 -> 获取二维码），交给用户手点最稳。"""
     log("浏览器已停在知识星球登录页，请手动完成：")
     log("  1. 勾选「我已阅读并同意」→ 弹窗点「同意」")
     log("  2. 点「获取登录二维码」，用微信扫码")
@@ -229,7 +231,7 @@ def hint_login(page: Page) -> None:
 
 
 def wait_until_logged_in(page: Page, timeout_s: int) -> bool:
-    """连续两次判定为已登录才算数，避免页面跳转瞬间的误判。"""
+    """连续两次判定已登录才算数，避开页面跳转瞬间。"""
     deadline = time.time() + timeout_s
     stable = 0
     while time.time() < deadline:
@@ -250,31 +252,54 @@ def wait_for_login(page: Page, timeout_s: int = 600) -> None:
     hint_login(page)
     log("请用微信扫码登录（二维码在浏览器窗口里），脚本会自动等待……")
     if not wait_until_logged_in(page, timeout_s):
-        raise SystemExit("等待登录超时，请重新运行 `login`。")
+        raise SystemExit("等待登录超时，请先运行 `login`。")
     log("登录成功，继续。")
     page.wait_for_timeout(2_000)
 
 
-def open_group(page: Page, group: str | None, group_url: str | None) -> None:
+def open_group(
+    page: Page,
+    group: str | None = None,
+    group_id: str | None = None,
+    group_url: str | None = None,
+) -> None:
+    """切换群组。
+
+    实测点击侧栏群组名会触发 SPA 路由但不刷新信息流（附件数为 0），
+    所以统一解析出 group_id 后直接导航 URL。
+    """
     if group_url:
         page.goto(group_url, wait_until="domcontentloaded", timeout=60_000)
-        page.wait_for_timeout(2_000)
-        return
-    if not group:
-        raise SystemExit("需要 --group 或 --group-url 指定目标群组。")
-    log(f"在左侧列表里查找群组：{group}")
-    locator = page.get_by_text(group, exact=False).first
-    try:
-        locator.click(timeout=15_000)
-    except PWTimeout:
-        raise SystemExit(
-            f"没在页面上找到群组「{group}」。可以改用 --group-url 直接贴群组链接。"
-        ) from None
-    page.wait_for_timeout(2_500)
+    else:
+        if not group_id and group:
+            log(f"在左侧列表里查找群组：{group}")
+            groups = list_groups(page)
+            matched = [g for g in groups if group in g["name"]]
+            if not matched:
+                available = "、".join(g["name"] for g in groups[:12]) or "（没读到列表）"
+                raise SystemExit(
+                    f"没找到群组「{group}」。可用的有：{available}\n"
+                    f"也可以用 --group-id 直接指定。"
+                )
+            group_id = matched[0]["group_id"]
+            log(f"匹配到：{matched[0]['name']}（{group_id}）")
+        if group_id:
+            page.goto(GROUP_URL.format(gid=group_id), wait_until="domcontentloaded", timeout=60_000)
+        elif "/group/" in page.url:
+            log(f"沿用当前已打开的群组：{page.url}")
+            return
+        else:
+            raise SystemExit("需要 --group / --group-id / --group-url 指定群组。")
+    wait_for_app_ready(page, timeout_s=30)
+    page.wait_for_timeout(2_000)
 
 
-def tag_pdfs(page: Page) -> list[dict]:
-    return page.evaluate(TAG_PDFS_JS)
+def list_groups(page: Page) -> list[dict]:
+    return page.evaluate(LIST_GROUPS_JS)
+
+
+def tag_files(page: Page) -> list[dict]:
+    return page.evaluate(TAG_FILES_JS)
 
 
 def collect_dates(page: Page) -> list[dict]:
@@ -283,7 +308,8 @@ def collect_dates(page: Page) -> list[dict]:
 
 def parse_date_label(text: str, today: date | None = None) -> date | None:
     today = today or date.today()
-    if text in ("今天",):
+    text = text.split(" ")[0].strip()
+    if text == "今天":
         return today
     if text == "昨天":
         return today - timedelta(days=1)
@@ -333,49 +359,72 @@ def scroll_until(page: Page, since: date | None, max_scrolls: int, pause: float)
         if since and i >= 1:
             oldest = oldest_date_on_page(page)
             if oldest and oldest < since:
-                log(f"已滚到 {oldest} 的帖子，早于 {since}，停止滚动。")
+                log(f"已滚到 {oldest}，早于 {since}，停止滚动。")
                 break
 
 
 def close_modal(page: Page) -> None:
+    """关掉「文件详情」弹窗。"""
+    if page.locator(DOWNLOAD_SELECTOR).count() == 0:
+        return
     page.keyboard.press("Escape")
-    page.wait_for_timeout(600)
-    for selector in ("[class*='close']", "button[aria-label*='关闭']"):
+    try:
+        page.locator(DOWNLOAD_SELECTOR).first.wait_for(state="hidden", timeout=3_000)
+        return
+    except PWTimeout:
+        pass
+    for selector in ("i.icon-close", "[class*='close']", "button[aria-label*='关闭']"):
         try:
-            page.locator(selector).first.click(timeout=1_000)
-            break
-        except Exception:  # noqa: BLE001 - 关不掉也不致命
+            page.locator(selector).first.click(timeout=1_500)
+            page.wait_for_timeout(500)
+            if page.locator(DOWNLOAD_SELECTOR).count() == 0:
+                return
+        except Exception:  # noqa: BLE001
             continue
-    page.wait_for_timeout(400)
+    page.wait_for_timeout(300)
+
+
+def open_file_card(page: Page, idx: int, name_hint: str) -> bool:
+    """点开附件卡片。优先真实点击，被遮挡时退回 JS click。"""
+    card = page.locator(f'[{TAG_ATTR}="{idx}"]')
+    try:
+        card.scroll_into_view_if_needed(timeout=5_000)
+    except PWError:
+        pass
+    try:
+        card.click(timeout=8_000)
+        return True
+    except PWError:
+        pass
+    try:
+        card.evaluate("el => el.click()")
+        return True
+    except PWError:
+        log(f"  ! {name_hint}：点不开附件，跳过。")
+        return False
 
 
 def download_one(page: Page, idx: int, name_hint: str, out_dir: Path, timeout_s: int) -> Path | None:
-    handle = page.locator(f'[data-zsxq-dl="{idx}"]')
-    handle.scroll_into_view_if_needed(timeout=5_000)
-    handle.click(timeout=10_000)
-    page.wait_for_timeout(1_200)
+    if not open_file_card(page, idx, name_hint):
+        return None
 
-    button = page.get_by_text(MODAL_TEXT_RE).first
+    button = page.locator(DOWNLOAD_SELECTOR).first
     try:
-        button.wait_for(state="visible", timeout=8_000)
+        button.wait_for(state="visible", timeout=10_000)
     except PWTimeout:
-        body = page.inner_text("body", timeout=5_000)
-        if any(hint in body for hint in PROTECTED_HINTS):
-            log(f"  ! {name_hint}：该群开启了内容保护，只能手机 App 下载，跳过。")
-        else:
-            log(f"  ! {name_hint}：没找到「下载文件」按钮，跳过。可用 probe 校准。")
+        log(f"  ! {name_hint}：弹窗里没有「下载文件」按钮，可能是内容保护，跳过。")
         close_modal(page)
         return None
 
     try:
         with page.expect_download(timeout=timeout_s * 1000) as info:
             button.click(timeout=10_000)
+        download = info.value
     except PWTimeout:
         log(f"  ! {name_hint}：点击后没有触发下载，跳过。")
         close_modal(page)
         return None
 
-    download = info.value
     filename = sanitize(download.suggested_filename or name_hint)
     target = unique_path(out_dir / filename)
     download.save_as(str(target))
@@ -387,14 +436,12 @@ def cmd_login(args: argparse.Namespace) -> int:
     with sync_playwright() as pw:
         ctx, page = launch(pw, headless=False)
         page = on_zsxq(page)
-        page.wait_for_timeout(2_500)
         if looks_logged_out(page):
-            log("未登录，已打开登录页。")
             hint_login(page)
             log(f"脚本会等待 {args.wait}s，期间扫码即可，扫完自动继续……")
             try:
                 ok = wait_until_logged_in(page, args.wait)
-            except PWError as exc:  # 用户手动关了窗口
+            except PWError as exc:
                 log(f"浏览器窗口已关闭（{str(exc).splitlines()[0]}）。")
                 return 1
             if not ok:
@@ -403,7 +450,6 @@ def cmd_login(args: argparse.Namespace) -> int:
                 return 1
             if not verify_logged_in(page):
                 log("检测到跳转，但重新加载后又回到登录页，登录态没保存成功。")
-                log("请再扫一次（有时二维码会话会过期）。")
                 ctx.close()
                 return 1
             log("登录成功，登录态已验证。")
@@ -414,37 +460,49 @@ def cmd_login(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_groups(args: argparse.Namespace) -> int:
+    with sync_playwright() as pw:
+        ctx, page = launch(pw, headless=True)
+        page = on_zsxq(page)
+        if looks_logged_out(page):
+            ctx.close()
+            raise SystemExit("未登录，先运行 `login`。")
+        page.wait_for_timeout(2_000)
+        groups = list_groups(page)
+        ctx.close()
+    if not groups:
+        log("没读到群组列表，页面结构可能变了，跑 `probe` 看看。")
+        return 1
+    for item in groups:
+        log(f"  - {item['name']}  [{item['group_id'] or '未知 id'}]")
+    return 0
+
+
 def cmd_probe(args: argparse.Namespace) -> int:
     PROBE_DIR.mkdir(parents=True, exist_ok=True)
-    with sync_playwright() as ctx_mgr:
-        ctx, page = launch(ctx_mgr, headless=False)
+    with sync_playwright() as pw:
+        ctx, page = launch(pw, headless=False)
         page = on_zsxq(page)
-        page.wait_for_timeout(2_000)
         if looks_logged_out(page):
             log("未登录，请先在浏览器里登录（自动等待）。")
             hint_login(page)
             if not wait_until_logged_in(page, args.wait):
-                log("仍未登录，退出。先跑 `login`。")
                 ctx.close()
                 return 1
 
-        if args.group or args.group_url:
-            open_group(page, args.group, args.group_url)
+        if args.group or args.group_id or args.group_url:
+            open_group(page, args.group, args.group_id, args.group_url)
 
-        if args.scroll:
-            for _ in range(args.scroll):
-                page.evaluate("window.scrollBy(0, 900)")
-                page.wait_for_timeout(1_000)
-
-        if sys.stdin.isatty() and not (args.group or args.group_url):
-            input("请手动进入目标群组并滚动到有 PDF 的位置，然后按 Enter 导出……")
-        else:
-            page.wait_for_timeout(args.pause * 1000)
+        for _ in range(args.scroll):
+            page.evaluate("window.scrollBy(0, 900)")
+            page.wait_for_timeout(1_000)
+        page.wait_for_timeout(int(args.pause * 1000))
 
         result = {
             "url": page.url,
             "title": page.title(),
-            "pdf_candidates": tag_pdfs(page),
+            "groups": list_groups(page),
+            "files": tag_files(page),
             "dates": collect_dates(page),
         }
         (PROBE_DIR / "page.html").write_text(page.content(), encoding="utf-8")
@@ -452,55 +510,66 @@ def cmd_probe(args: argparse.Namespace) -> int:
             json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         page.screenshot(path=str(PROBE_DIR / "screen.png"), full_page=False)
-        log(f"已导出：{PROBE_DIR}（page.html / probe.json / screen.png）")
-        log(f"识别到 PDF 候选 {len(result['pdf_candidates'])} 个。")
+        log(f"已导出 {PROBE_DIR}（page.html / probe.json / screen.png）")
+        log(f"识别到附件 {len(result['files'])} 个，群组 {len(result['groups'])} 个。")
         ctx.close()
     return 0
+
+
+def resolve_since(args: argparse.Namespace) -> date | None:
+    if getattr(args, "since", None):
+        return datetime.strptime(args.since, "%Y-%m-%d").date()
+    if getattr(args, "days", None):
+        return date.today() - timedelta(days=args.days)
+    return None
+
+
+def match_ext(name: str, exts: list[str]) -> bool:
+    lower = name.lower()
+    return any(lower.endswith("." + e.lower().lstrip(".")) for e in exts)
 
 
 def cmd_download(args: argparse.Namespace) -> int:
     out_dir = Path(args.out).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
-    since = None
-    if args.days:
-        since = date.today() - timedelta(days=args.days)
-    if args.since:
-        since = datetime.strptime(args.since, "%Y-%m-%d").date()
+    since = resolve_since(args)
+    exts = [e.strip() for e in args.ext.split(",") if e.strip()]
 
     with sync_playwright() as pw:
-        ctx, page = launch(pw, headless=False)
+        ctx, page = launch(pw, headless=args.headless)
         page = on_zsxq(page)
-        page.wait_for_timeout(2_000)
-        wait_for_login(page)
-
-        open_group(page, args.group, args.group_url)
+        wait_for_login(page, args.wait)
+        open_group(page, args.group, args.group_id, args.group_url)
         scroll_until(page, since, args.max_scrolls, args.pause)
 
-        candidates = tag_pdfs(page)
-        log(f"本页识别到 {len(candidates)} 个 PDF 附件。")
-        if not candidates:
-            log("没识别到 PDF。请运行 `python src/zsxq_dl.py probe` 导出结构后校准选择器。")
+        all_files = tag_files(page)
+        files = [f for f in all_files if match_ext(f["text"], exts)]
+        log(f"页面附件 {len(all_files)} 个，匹配 {exts} 的 {len(files)} 个。")
+        if not files:
             ctx.close()
+            log("没有匹配的附件。用 `probe` 看看页面结构，或换 --ext。")
             return 2
 
         done: list[str] = []
         failed: list[str] = []
-        for pos, cand in enumerate(candidates, 1):
-            name_hint = cand["text"]
-            if args.limit and pos > args.limit:
+        skipped = 0
+        for pos, item in enumerate(files, 1):
+            name = item["text"]
+            if args.limit and len(done) >= args.limit:
                 break
-            existing = out_dir / sanitize(name_hint)
-            if existing.exists() and not args.force:
-                log(f"[{pos}/{len(candidates)}] 已存在，跳过：{name_hint}")
+            target = out_dir / sanitize(name)
+            if target.exists() and not args.force:
+                skipped += 1
+                log(f"[{pos}/{len(files)}] 已存在，跳过：{name}")
                 continue
-            log(f"[{pos}/{len(candidates)}] 下载：{name_hint}")
+            log(f"[{pos}/{len(files)}] 下载：{name}")
             saved = None
             for attempt in (1, 2):
                 try:
-                    saved = download_one(page, cand["idx"], name_hint, out_dir, args.timeout)
+                    saved = download_one(page, item["idx"], name, out_dir, args.timeout)
                     break
-                except Exception as exc:  # noqa: BLE001 - 单条失败不影响整体
-                    log(f"  第 {attempt} 次尝试失败：{exc}")
+                except Exception as exc:  # noqa: BLE001
+                    log(f"  第 {attempt} 次失败：{type(exc).__name__}: {str(exc)[:120]}")
                     try:
                         close_modal(page)
                     except Exception:  # noqa: BLE001
@@ -509,12 +578,11 @@ def cmd_download(args: argparse.Namespace) -> int:
             if saved:
                 done.append(saved.name)
             else:
-                failed.append(name_hint)
-
+                failed.append(name)
         ctx.close()
 
     log("\n===== 结果 =====")
-    log(f"成功 {len(done)} 个，失败 {len(failed)} 个，目录：{out_dir}")
+    log(f"成功 {len(done)}，跳过 {skipped}，失败 {len(failed)}，目录：{out_dir}")
     for name in done:
         log(f"  + {name}")
     for name in failed:
@@ -522,77 +590,81 @@ def cmd_download(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def cmd_dry_run(args: argparse.Namespace) -> int:
+    since = resolve_since(args)
+    exts = [e.strip() for e in args.ext.split(",") if e.strip()]
+    with sync_playwright() as pw:
+        ctx, page = launch(pw, headless=True)
+        page = on_zsxq(page)
+        wait_for_login(page, args.wait)
+        open_group(page, args.group, args.group_id, args.group_url)
+        scroll_until(page, since, args.max_scrolls, args.pause)
+        all_files = tag_files(page)
+        dates = collect_dates(page)
+        ctx.close()
+
+    files = [f for f in all_files if match_ext(f["text"], exts)]
+    log(f"页面附件 {len(all_files)} 个，匹配 {exts} 的 {len(files)} 个：")
+    for item in files:
+        log(f"  [{item['idx']}] {item['text']}")
+    parsed = sorted({d for d in (parse_date_label(x["text"]) for x in dates) if d})
+    if parsed:
+        log(f"页面日期范围：{parsed[0]} ~ {parsed[-1]}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="知识星球 PDF 批量下载器（Playwright 本地版）",
+        description="知识星球附件批量下载器（Playwright 本地版）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_login = sub.add_parser("login", help="打开浏览器手动登录，保存登录态")
-    p_login.add_argument("--wait", type=int, default=600, help="等待扫码登录的秒数")
+    p_login.add_argument("--wait", type=int, default=1800, help="等待扫码的秒数")
     p_login.set_defaults(func=cmd_login)
 
-    p_probe = sub.add_parser("probe", help="导出当前页面结构，用于校准选择器")
-    p_probe.add_argument("--group", help="自动打开的群组名（模糊匹配）")
-    p_probe.add_argument("--group-url", help="自动打开的群组链接")
-    p_probe.add_argument("--scroll", type=int, default=0, help="导出前先向下滚 N 屏")
-    p_probe.add_argument("--pause", type=float, default=3.0, help="导出前等待页面加载的秒数")
-    p_probe.add_argument("--wait", type=int, default=180, help="等待登录的秒数")
+    p_groups = sub.add_parser("groups", help="列出已加入的群组名")
+    p_groups.set_defaults(func=cmd_groups)
+
+    p_probe = sub.add_parser("probe", help="导出页面结构，用于校准选择器")
+    p_probe.add_argument("--group", help="群组名（模糊匹配）")
+    p_probe.add_argument("--group-id", help="群组 id（URL 里的数字）")
+    p_probe.add_argument("--group-url", help="群组完整链接")
+    p_probe.add_argument("--scroll", type=int, default=0, help="导出前先滚 N 屏")
+    p_probe.add_argument("--pause", type=float, default=3.0, help="导出前等待秒数")
+    p_probe.add_argument("--wait", type=int, default=300, help="等待登录的秒数")
     p_probe.set_defaults(func=cmd_probe)
 
-    p_dl = sub.add_parser("download", help="按群组和日期批量下载 PDF")
-    p_dl.add_argument("--group", help="左侧群组列表中显示的群组名（模糊匹配）")
-    p_dl.add_argument("--group-url", help="群组页面完整链接（比 --group 更稳）")
-    p_dl.add_argument("--days", type=int, default=7, help="只处理最近 N 天的帖子（默认 7）")
-    p_dl.add_argument("--since", help="起始日期 YYYY-MM-DD，优先级高于 --days")
+    def add_common(p):
+        p.add_argument("--group", help="群组名（模糊匹配）")
+        p.add_argument("--group-id", help="群组 id（URL 里的数字，最稳）")
+        p.add_argument("--group-url", help="群组完整链接")
+        p.add_argument("--days", type=int, default=7, help="只处理最近 N 天（默认 7）")
+        p.add_argument("--since", help="起始日期 YYYY-MM-DD，优先于 --days")
+        p.add_argument("--ext", default="pdf", help="附件扩展名，逗号分隔，默认 pdf")
+        p.add_argument("--max-scrolls", type=int, default=60, help="最多滚多少屏")
+        p.add_argument("--pause", type=float, default=1.2, help="每屏等待秒数")
+        p.add_argument("--wait", type=int, default=600, help="等待登录的秒数")
+
+    p_dl = sub.add_parser("download", help="按群组和日期批量下载附件")
+    add_common(p_dl)
     p_dl.add_argument("--out", default=str(DEFAULT_OUT), help="下载目录（默认 ~/Downloads/zsxq）")
-    p_dl.add_argument("--max-scrolls", type=int, default=60, help="最多滚动多少屏（默认 60）")
-    p_dl.add_argument("--pause", type=float, default=1.2, help="每屏滚动后等待秒数")
-    p_dl.add_argument("--timeout", type=int, default=45, help="单个文件下载超时秒数")
-    p_dl.add_argument("--limit", type=int, help="本次最多下载多少个（调试用）")
-    p_dl.add_argument("--force", action="store_true", help="同名文件已存在时仍重新下载")
-    p_dl.add_argument("--dry-run", action="store_true", help="只列出识别结果，不实际下载")
+    p_dl.add_argument("--timeout", type=int, default=60, help="单个文件下载超时秒数")
+    p_dl.add_argument("--limit", type=int, help="本次最多成功下载几个（调试用）")
+    p_dl.add_argument("--force", action="store_true", help="同名文件已存在也重新下载")
+    p_dl.add_argument("--headless", action="store_true", help="无头模式（看不到浏览器）")
     p_dl.set_defaults(func=cmd_download)
+
+    p_dry = sub.add_parser("dry-run", help="只列出识别到的附件，不下载")
+    add_common(p_dry)
+    p_dry.set_defaults(func=cmd_dry_run)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if getattr(args, "dry_run", False):
-        args.func = lambda a: _dry_run(a)
     return args.func(args)
-
-
-def _dry_run(args: argparse.Namespace) -> int:
-    """扫描但不点击，用来确认群组/日期/文件识别是否正确。"""
-    since = None
-    if args.days:
-        since = date.today() - timedelta(days=args.days)
-    if args.since:
-        since = datetime.strptime(args.since, "%Y-%m-%d").date()
-
-    with sync_playwright() as pw:
-        ctx, page = launch(pw, headless=False)
-        page = on_zsxq(page)
-        page.wait_for_timeout(2_000)
-        wait_for_login(page)
-        open_group(page, args.group, args.group_url)
-        scroll_until(page, since, args.max_scrolls, args.pause)
-        candidates = tag_pdfs(page)
-        dates = collect_dates(page)
-        ctx.close()
-
-    log(f"识别到 {len(candidates)} 个 PDF：")
-    for cand in candidates:
-        log(f"  - {cand['text']}")
-    if dates:
-        parsed = sorted(
-            {d for d in (parse_date_label(item["text"]) for item in dates) if d}
-        )
-        if parsed:
-            log(f"页面日期范围：{parsed[0]} ~ {parsed[-1]}")
-    return 0
 
 
 if __name__ == "__main__":

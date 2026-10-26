@@ -13,13 +13,16 @@
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 .venv\Scripts\python.exe src\zsxq_dl.py login
-.venv\Scripts\python.exe src\zsxq_dl.py download --group "群组名" --days 7 --dry-run
+.venv\Scripts\python.exe src\zsxq_dl.py groups
+.venv\Scripts\python.exe src\zsxq_dl.py dry-run --group "群组名" --days 7
 ```
 
 ## 关键约定
 
-- `.browser-profile/` 存登录态，**不进 git**；`probe/`、下载产物同样忽略。
-- 页面结构变化时先跑 `probe` 导出 HTML/JSON，再改 `src/zsxq_dl.py` 顶部的选择器常量。
+- `.browser-profile/` 存登录态，**不进 git**；`probe/`、`.tmp/`、下载产物同样忽略。
+- 页面结构变化时先跑 `probe` 导出 HTML/JSON，再改 `src/zsxq_dl.py` 顶部的 `FILE_SELECTOR` / `DOWNLOAD_SELECTOR`。
+- 切群组必须按 group_id 导航 URL，点侧栏群组名不会刷新信息流。
+- 不要改走 `api.zsxq.com`：官方明确拦截非官方工具（code 1059）。
 - 内容保护（仅 App 可下载）只识别、不绕过。
 
 ## 部署 / 发布

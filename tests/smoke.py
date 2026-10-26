@@ -49,7 +49,7 @@ def test_date_parsing() -> None:
 
 def test_sanitize() -> None:
     assert z.sanitize('a/b:c*d?.pdf') == "a_b_c_d_.pdf"
-    assert z.sanitize("   ") == "unnamed.pdf"
+    assert z.sanitize("   ") == "unnamed"
 
 
 def test_browser_flow() -> None:
@@ -63,8 +63,8 @@ def test_browser_flow() -> None:
         try:
             page.goto(FIXTURE)
 
-            candidates = z.tag_pdfs(page)
-            assert len(candidates) == 4, f"应识别 4 个 PDF，实际 {len(candidates)}"
+            candidates = z.tag_files(page)
+            assert len(candidates) == 4, f"应识别 4 个附件，实际 {len(candidates)}"
             names = [c["text"] for c in candidates]
             assert "2026年宏观策略.pdf" in names
 

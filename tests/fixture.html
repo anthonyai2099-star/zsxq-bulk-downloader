@@ -7,14 +7,15 @@
   body { font-family: system-ui, sans-serif; margin: 0; background: #f5f6f7; }
   .topic { background: #fff; margin: 12px auto; padding: 16px; width: 680px; border-radius: 8px; }
   .date { color: #999; font-size: 12px; margin-bottom: 8px; }
-  .file { display: inline-block; margin-top: 8px; padding: 6px 10px; border: 1px solid #ddd;
-          border-radius: 4px; cursor: pointer; color: #1a6ee0; }
+  .file-name { display: inline-block; margin-top: 8px; padding: 6px 10px; border: 1px solid #ddd;
+               border-radius: 4px; cursor: pointer; color: #1a6ee0; }
   #modal { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: none;
            align-items: center; justify-content: center; }
   #modal.open { display: flex; }
   .dialog { background: #fff; padding: 24px; border-radius: 10px; min-width: 320px; }
-  .protect { color: #d33; font-size: 13px; }
-  #dl { margin-top: 16px; padding: 8px 18px; }
+  .btn.download { display: inline-block; margin-top: 16px; padding: 8px 18px; cursor: pointer;
+                  border: 1px solid #1abc9c; color: #1abc9c; border-radius: 18px; }
+  .protect { color: #d33; font-size: 13px; margin-top: 12px; }
 </style>
 </head>
 <body>
@@ -23,16 +24,16 @@
   <div id="modal">
     <div class="dialog">
       <div id="fname"></div>
-      <div id="protect" class="protect" style="display:none">请在App中查看</div>
-      <button id="dl">下载文件</button>
+      <div id="protect" class="protect" style="display:none">该文件仅支持在 App 内下载</div>
+      <div class="btn download" id="dl">下载文件</div>
     </div>
   </div>
 
 <script>
   const posts = [
-    { date: "10-26", files: ["2026年宏观策略.pdf", "半导体行业跟踪.pdf"], protect: false },
-    { date: "10-25", files: ["消费复苏验证.pdf"], protect: false },
-    { date: "10-20", files: ["会员专享研报.pdf"], protect: true },
+    { date: "2026-10-26 07:22", files: ["2026年宏观策略.pdf", "半导体行业跟踪.pdf"], protect: false },
+    { date: "2026-10-25 08:07", files: ["消费复苏验证.pdf"], protect: false },
+    { date: "2026-10-20 09:15", files: ["会员专享研报.pdf"], protect: true },
   ];
 
   const feed = document.getElementById("feed");
@@ -44,8 +45,8 @@
     d.textContent = post.date;
     el.appendChild(d);
     for (const name of post.files) {
-      const f = document.createElement("span");
-      f.className = "file";
+      const f = document.createElement("div");
+      f.className = "file-name";
       f.textContent = name;
       f.addEventListener("click", () => openModal(name, post.protect));
       el.appendChild(f);

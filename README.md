@@ -1,8 +1,8 @@
 # tools-zsxq-pdf-downloader
 
-把 [zsxq-pdf-downloader 技能](https://github.com/silentdog918/zsxq-pdf-downloader-skill) 改造成本机可直接运行的版本：用 Playwright 驱动本机浏览器，登录一次知识星球后，按群组 + 日期范围批量下载帖子里的 PDF 附件。
+把 [zsxq-pdf-downloader 技能](https://github.com/silentdog918/zsxq-pdf-downloader-skill) 改造成本机可直接运行的版本：用 Playwright 驱动本机浏览器，登录一次知识星球后，按群组 + 日期范围批量下载帖子里的附件（默认 PDF）。
 
-原技能依赖 Claude in Chrome 扩展提供的 `tabs_context_mcp` / `javascript_tool` / `find` 等 MCP 工具，本机没有这些工具，因此这里只保留它的**流程知识**（见 [docs/original-skill.md](docs/original-skill.md)），执行层换成本地浏览器自动化。
+原技能依赖 Claude in Chrome 扩展提供的 `tabs_context_mcp` / `javascript_tool` / `read_page` 等 MCP 工具，本机没有这些工具，因此这里只保留它的**流程知识**（见 [docs/original-skill.md](docs/original-skill.md)），执行层换成本地浏览器自动化。
 
 ## 技术栈
 
@@ -19,69 +19,87 @@ python -m venv .venv
 
 ## 使用
 
-三步走：**登录一次 → 试跑确认识别 → 正式下载**。
+**登录一次 → 确认群组 → 试跑 → 正式下载**。
 
 ```powershell
-# 1. 登录（弹出浏览器，手动扫码，回车退出；登录态写入 .browser-profile）
+# 1. 登录：弹出浏览器，微信扫码；登录态写入 .browser-profile（之后不用再扫）
 .\.venv\Scripts\python.exe src\zsxq_dl.py login
 
-# 2. 试跑：只识别不下载，确认群组、日期、PDF 都被认出来了
-.\.venv\Scripts\python.exe src\zsxq_dl.py download --group "探索者01" --days 3 --dry-run
+# 2. 看自己加入了哪些群组（带 group_id）
+.\.venv\Scripts\python.exe src\zsxq_dl.py groups
 
-# 3. 正式下载
-.\.venv\Scripts\python.exe src\zsxq_dl.py download --group "探索者01" --days 7 --out "$HOME\Downloads\zsxq"
+# 3. 试跑：只列出识别到的附件，不下载
+.\.venv\Scripts\python.exe src\zsxq_dl.py dry-run --group "系统技术" --days 7
+
+# 4. 正式下载
+.\.venv\Scripts\python.exe src\zsxq_dl.py download --group "系统技术" --days 7 --out "$HOME\Downloads\zsxq"
 ```
 
 常用参数：
 
 | 参数 | 说明 |
 | --- | --- |
-| `--group` / `--group-url` | 群组名模糊匹配，或直接贴群组页面链接（更稳） |
+| `--group` | 群组名模糊匹配，自动解析成 id 后跳转 |
+| `--group-id` | 群组 id（`groups` 命令能看到），最稳 |
+| `--group-url` | 群组完整链接 |
 | `--days N` | 只处理最近 N 天（默认 7） |
 | `--since YYYY-MM-DD` | 指定起始日期，优先于 `--days` |
+| `--ext pdf` | 附件类型，逗号分隔，如 `pdf,docx` |
 | `--out DIR` | 下载目录，默认 `~/Downloads/zsxq` |
-| `--max-scrolls N` | 最多滚多少屏（默认 60） |
-| `--limit N` | 本次最多下几个，调试用 |
-| `--dry-run` | 只列出识别结果，不点击 |
+| `--limit N` | 本次最多成功下载几个，调试用 |
 | `--force` | 同名文件已存在也重新下 |
+| `--headless` | 无头模式（看不到浏览器窗口） |
+
+## 真实页面结构（2026-10 校准）
+
+| 元素 | 选择器 |
+| --- | --- |
+| 附件卡片 | `div.file-name`（文字即文件名，点击弹出「文件详情」） |
+| 下载按钮 | `div.btn.download`（弹窗内，文字「下载文件」） |
+| 群组侧栏 | `span.group-name`，外层 `<a href="/group/{id}">` |
+| 帖子时间 | `2026-10-26 07:22` |
+
+两个实测坑：
+
+1. **切换群组必须走 URL**。点侧栏群组名只改 SPA 路由，信息流不刷新，附件数会读成 0；必须解析出 group_id 后 `goto` 群组页。代码里已经这么做。
+2. **不能走 API**。`api.zsxq.com` 对非官方工具返回 `code 1059`（"不支持非官方工具访问"），只保留浏览器模拟点击这一条路。
 
 ## 识别不准怎么办
 
-页面改版会导致「PDF 卡片」或「下载文件」按钮定位失败。先导出真实结构：
+页面改版会导致附件卡片或下载按钮定位失败。先导出真实结构：
 
 ```powershell
-.\.venv\Scripts\python.exe src\zsxq_dl.py probe
-# 浏览器里手动进入群组、滚到有 PDF 的位置，回到终端按 Enter
+.\.venv\Scripts\python.exe src\zsxq_dl.py probe --group "系统技术" --scroll 3
 # 产出 probe/page.html、probe/probe.json、probe/screen.png
 ```
 
-然后把 `probe.json` 里的 `pdf_candidates` 与 `page.html` 拿出来，调整 `src/zsxq_dl.py` 顶部的两个 JS 片段（`TAG_PDFS_JS` 决定什么算 PDF 附件，`MODAL_TEXT_RE` 决定下载按钮文案）。
+然后对照 `probe.json`，调整 `src/zsxq_dl.py` 顶部的 `FILE_SELECTOR` / `DOWNLOAD_SELECTOR`。
+
+## 离线自检
+
+不需要登录，用本地 fixture 页面验证「识别 → 点击 → 弹窗 → 下载 → 落盘 → 内容保护」全链路：
+
+```powershell
+.\.venv\Scripts\python.exe tests\smoke.py
+```
 
 ## 已知限制
 
-- **内容保护**：群主开启「仅 App 可下载」时，网页端没有下载按钮，脚本会识别并跳过，不尝试绕过。
-- **日期只按页面上的日期标签估算**：用于决定何时停止滚动，不是精确过滤；`--dry-run` 输出的日期范围可用于核对。
-- **需人工登录**：不处理账号密码，登录必须在浏览器里手动完成。
-- **下载入口依赖 DOM**：知识星球改版后需要按上面的 probe 流程校准一次。
-- 同名文件默认跳过，不会产生 `(1)(2)` 垃圾文件。
+- **内容保护**：群主开启「仅 App 可下载」时弹窗里没有下载按钮，脚本识别并跳过，不尝试绕过。
+- **日期只按页面上的时间标签估算**：用来决定何时停止滚动，不是精确过滤；`dry-run` 会输出页面日期范围供核对。
+- **需人工登录**：不处理账号密码，二维码要在浏览器里手动扫；登录态有效期由知识星球决定，过期后重跑 `login` 即可。
+- **同名文件默认跳过**，不会产生 `(1)(2)` 垃圾文件；`--force` 可覆盖。
+- 下载的是你自己账号有权限的内容，脚本只做批量点击，不绕过任何权限或保护。
 
 ## 部署 / 发布
 
-本机工具，不发布。拷贝整个目录（不含 `.venv`、`.browser-profile`、`probe`、`downloads`）即可在另一台机器复现。
+本机工具，不发布。拷贝整个目录（不含 `.venv`、`.browser-profile`、`.tmp`、`probe`）即可在另一台机器复现。
 
-## 进度（2026-10-26 暂停）
+## 状态（2026-10-27）
 
-已完成：
+已跑通真实环境：
 
-- 原技能已安装到 `C:\Users\anthony\.claude\skills\zsxq-pdf-downloader\`（DSH 从该目录加载技能，新会话生效）
-- 本机版脚本、README、离线自检 fixture 已就绪
-
-未完成（下次接着做）：
-
-1. `.venv` 里装 Playwright —— 卡在下载 38.8 MB wheel（清华镜像无进展），可换源重试：
-   `.venv\Scripts\python.exe -m pip install -i https://mirrors.aliyun.com/pypi/simple/ playwright`
-2. 跑离线自检：`.venv\Scripts\python.exe tests\smoke.py`（不需要知识星球账号）
-3. 真实环境校准：`login` 登录 → `probe` 导出页面结构 → 按需修 `TAG_PDFS_JS` / `MODAL_TEXT_RE`
-4. 用 `--dry-run` 验证群组与日期识别，再正式批量下载
-
-已知风险：下载按钮文案与 PDF 卡片结构未在真实页面验证过，首次必须走 `probe`。
+- 登录态验证通过（`.browser-profile` 持久化，重启浏览器仍有效）
+- 群组解析：3 个群组 id 全部正确
+- 真实下载：`系统技术，技术情报交流` 近 3 天 2 个 PDF 全部落盘（2.81 MB + 3.35 MB），重复文件自动跳过
+- 离线自检 3/3 通过

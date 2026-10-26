@@ -4,3 +4,5 @@ probe/
 __pycache__/
 *.pyc
 downloads/
+.tmp/
+pip-install*.log

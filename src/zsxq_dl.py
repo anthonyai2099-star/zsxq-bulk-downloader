@@ -15,11 +15,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
+
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")  # Windows 控制台默认 GBK，中文会乱码
+    except Exception:  # noqa: BLE001 - 被重定向或老版本时忽略
+        pass
 
 from playwright.sync_api import BrowserContext, Page, TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
@@ -27,6 +34,7 @@ from playwright.sync_api import sync_playwright
 ROOT = Path(__file__).resolve().parent.parent
 PROFILE_DIR = ROOT / ".browser-profile"
 PROBE_DIR = ROOT / "probe"
+TMP_DIR = ROOT / ".tmp"
 DEFAULT_OUT = Path.home() / "Downloads" / "zsxq"
 HOME_URL = "https://wx.zsxq.com/"
 
@@ -104,8 +112,17 @@ def unique_path(path: Path) -> Path:
         n += 1
 
 
+def ensure_temp_dir() -> None:
+    """沙箱环境下系统 TEMP 可能不可写，Playwright 会在 TEMP 下建临时目录导致 EPERM。
+    这里把 TEMP/TMP 指到项目内的 .tmp，保证浏览器能正常启动。"""
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    os.environ["TEMP"] = str(TMP_DIR)
+    os.environ["TMP"] = str(TMP_DIR)
+
+
 def launch(pw, headless: bool = False) -> tuple[BrowserContext, Page]:
     """启动带持久化 profile 的浏览器；优先用本机 Edge，失败再退回 Chromium。"""
+    ensure_temp_dir()
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     common = dict(
         user_data_dir=str(PROFILE_DIR),
@@ -288,9 +305,20 @@ def cmd_login(args: argparse.Namespace) -> int:
         on_zsxq(page)
         page.wait_for_timeout(2_000)
         if looks_logged_out(page):
-            log("请在浏览器中扫码/账号登录知识星球。（已登录过会直接跳过）")
-        log("登录完成后回到本终端按 Enter 保存并退出……")
-        input()
+            log("未登录。请在弹出的浏览器窗口里扫码登录，脚本会自动等待。")
+            if sys.stdin.isatty():
+                input("登录完成后按 Enter 继续……")
+            else:
+                deadline = time.time() + args.wait
+                while time.time() < deadline and looks_logged_out(page):
+                    page.wait_for_timeout(2_000)
+                if looks_logged_out(page):
+                    log(f"等了 {args.wait}s 仍未检测到登录，先退出。")
+                    ctx.close()
+                    return 1
+            log("检测到已登录，保存登录态。")
+        else:
+            log("当前已是登录状态。")
         ctx.close()
     log(f"登录态已保存在：{PROFILE_DIR}")
     return 0
@@ -298,12 +326,33 @@ def cmd_login(args: argparse.Namespace) -> int:
 
 def cmd_probe(args: argparse.Namespace) -> int:
     PROBE_DIR.mkdir(parents=True, exist_ok=True)
-    with sync_playwright() as pw:
-        ctx, page = launch(pw, headless=False)
+    with sync_playwright() as ctx_mgr:
+        ctx, page = launch(ctx_mgr, headless=False)
         on_zsxq(page)
-        log("浏览器已打开。请手动进入目标群组，滚动到能看到 PDF 帖子的位置。")
-        log("准备好后回到本终端按 Enter 导出页面结构……")
-        input()
+        page.wait_for_timeout(2_000)
+        if looks_logged_out(page):
+            log("未登录，请先在浏览器里登录（自动等待）。")
+            deadline = time.time() + args.wait
+            while time.time() < deadline and looks_logged_out(page):
+                page.wait_for_timeout(2_000)
+            if looks_logged_out(page):
+                log("仍未登录，退出。先跑 `login`。")
+                ctx.close()
+                return 1
+
+        if args.group or args.group_url:
+            open_group(page, args.group, args.group_url)
+
+        if args.scroll:
+            for _ in range(args.scroll):
+                page.evaluate("window.scrollBy(0, 900)")
+                page.wait_for_timeout(1_000)
+
+        if sys.stdin.isatty() and not (args.group or args.group_url):
+            input("请手动进入目标群组并滚动到有 PDF 的位置，然后按 Enter 导出……")
+        else:
+            page.wait_for_timeout(args.pause * 1000)
+
         result = {
             "url": page.url,
             "title": page.title(),
@@ -393,9 +442,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_login = sub.add_parser("login", help="打开浏览器手动登录，保存登录态")
+    p_login.add_argument("--wait", type=int, default=300, help="非交互模式下等待登录的秒数")
     p_login.set_defaults(func=cmd_login)
 
     p_probe = sub.add_parser("probe", help="导出当前页面结构，用于校准选择器")
+    p_probe.add_argument("--group", help="自动打开的群组名（模糊匹配）")
+    p_probe.add_argument("--group-url", help="自动打开的群组链接")
+    p_probe.add_argument("--scroll", type=int, default=0, help="导出前先向下滚 N 屏")
+    p_probe.add_argument("--pause", type=float, default=3.0, help="导出前等待页面加载的秒数")
+    p_probe.add_argument("--wait", type=int, default=180, help="等待登录的秒数")
     p_probe.set_defaults(func=cmd_probe)
 
     p_dl = sub.add_parser("download", help="按群组和日期批量下载 PDF")

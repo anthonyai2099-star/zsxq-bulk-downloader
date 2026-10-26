@@ -187,14 +187,34 @@ def on_zsxq(page: Page) -> Page:
 
 
 def looks_logged_out(page: Page) -> bool:
-    """未登录时网站会跳转到 /login；页面刚加载完 body 可能为空，所以先看 URL。"""
-    if "/login" in page.url.lower():
+    """判断是否未登录。
+
+    注意：拿不到 body（导航中/inner_text 超时）必须当成「未登录」，
+    否则会被误判成登录成功——之前就是这样误报了两次。
+    """
+    url = page.url.lower()
+    if "/login" in url:
         return True
-    try:
-        body = page.inner_text("body", timeout=5_000)
-    except PWTimeout:
+    if "/dweb2" in url:
         return False
+    try:
+        body = page.inner_text("body", timeout=6_000)
+    except PWTimeout:
+        return True
+    body = body.strip()
+    if len(body) < 20:
+        return True
     return bool(re.search(r"登录知识星球|获取登录二维码|扫码登录", body))
+
+
+def verify_logged_in(page: Page) -> bool:
+    """重新加载首页确认登录态真的生效（cookie 可能没落盘）。"""
+    try:
+        page.goto(HOME_URL, wait_until="domcontentloaded", timeout=45_000)
+        wait_for_app_ready(page, timeout_s=20)
+    except PWError:
+        return False
+    return not looks_logged_out(page)
 
 
 def hint_login(page: Page) -> None:
@@ -208,20 +228,31 @@ def hint_login(page: Page) -> None:
         pass
 
 
+def wait_until_logged_in(page: Page, timeout_s: int) -> bool:
+    """连续两次判定为已登录才算数，避免页面跳转瞬间的误判。"""
+    deadline = time.time() + timeout_s
+    stable = 0
+    while time.time() < deadline:
+        page.wait_for_timeout(2_000)
+        if looks_logged_out(page):
+            stable = 0
+        else:
+            stable += 1
+            if stable >= 2:
+                return True
+    return False
+
+
 def wait_for_login(page: Page, timeout_s: int = 600) -> None:
     if not looks_logged_out(page):
         return
     log("检测到未登录。")
     hint_login(page)
     log("请用微信扫码登录（二维码在浏览器窗口里），脚本会自动等待……")
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        page.wait_for_timeout(2_000)
-        if not looks_logged_out(page):
-            log("登录成功，继续。")
-            page.wait_for_timeout(2_000)
-            return
-    raise SystemExit("等待登录超时，请重新运行 `login`。")
+    if not wait_until_logged_in(page, timeout_s):
+        raise SystemExit("等待登录超时，请重新运行 `login`。")
+    log("登录成功，继续。")
+    page.wait_for_timeout(2_000)
 
 
 def open_group(page: Page, group: str | None, group_url: str | None) -> None:
@@ -361,19 +392,21 @@ def cmd_login(args: argparse.Namespace) -> int:
             log("未登录，已打开登录页。")
             hint_login(page)
             log(f"脚本会等待 {args.wait}s，期间扫码即可，扫完自动继续……")
-            deadline = time.time() + args.wait
             try:
-                while time.time() < deadline and looks_logged_out(page):
-                    page.wait_for_timeout(2_000)
-                timed_out = looks_logged_out(page)
+                ok = wait_until_logged_in(page, args.wait)
             except PWError as exc:  # 用户手动关了窗口
                 log(f"浏览器窗口已关闭（{str(exc).splitlines()[0]}）。")
                 return 1
-            if timed_out:
+            if not ok:
                 log(f"等了 {args.wait}s 仍未检测到登录，先退出。")
                 ctx.close()
                 return 1
-            log("检测到已登录，保存登录态。")
+            if not verify_logged_in(page):
+                log("检测到跳转，但重新加载后又回到登录页，登录态没保存成功。")
+                log("请再扫一次（有时二维码会话会过期）。")
+                ctx.close()
+                return 1
+            log("登录成功，登录态已验证。")
         else:
             log("当前已是登录状态。")
         ctx.close()
@@ -389,10 +422,8 @@ def cmd_probe(args: argparse.Namespace) -> int:
         page.wait_for_timeout(2_000)
         if looks_logged_out(page):
             log("未登录，请先在浏览器里登录（自动等待）。")
-            deadline = time.time() + args.wait
-            while time.time() < deadline and looks_logged_out(page):
-                page.wait_for_timeout(2_000)
-            if looks_logged_out(page):
+            hint_login(page)
+            if not wait_until_logged_in(page, args.wait):
                 log("仍未登录，退出。先跑 `login`。")
                 ctx.close()
                 return 1

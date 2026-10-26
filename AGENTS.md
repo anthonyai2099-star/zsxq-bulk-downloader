@@ -1,4 +1,4 @@
-# tools-zsxq-pdf-downloader
+﻿# tools-zsxq-pdf-downloader
 
 知识星球（wx.zsxq.com）PDF 批量下载工具，给自己用：登录一次后按群组 + 日期范围把帖子里的 PDF 附件批量下载到本地。
 
@@ -20,7 +20,7 @@ python -m venv .venv
 ## 关键约定
 
 - **长期库固定在 `D:\知识星球下载\<群组>\`**；导出先落工作区暂存区
-  `D:\CLAUDE-CODE\Text\_exports\zsxq\<群组>\`，跑完用 `scripts\sync-to-d.ps1` 搬过去并合并 `_manifest.json`。
+  `D:\CLAUDE-CODE\Text\_exports\zsxq\<群组>\`，跑完用 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\sync-to-d.ps1` 搬过去并合并清单。
 - **增量下载**：扩大时间范围时（30 天→60 天）只改 `--days`，并加
   `--existing "D:\知识星球下载\<群组>"`，已下载文件按「帖子文件夹 + 文件名」自动跳过，不许重复下载。
 - Python 子进程只能写工作区，直接写 `D:\知识星球下载` 会 `PermissionError`，不要试图绕过（junction 也会被拦）。

@@ -95,8 +95,10 @@ Python 子进程被沙箱限制只能写工作区，写 `D:\知识星球下载` 
   --existing "D:\知识星球下载\系统技术"
 
 # 2. 搬到 D 盘长期库，并合并清单
-pwsh -File scripts\sync-to-d.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\sync-to-d.ps1
 ```
+
+> 本机执行策略禁止直接运行 .ps1，必须带 `-ExecutionPolicy Bypass`；`pwsh` 也不在 PATH 里，用 `powershell`。
 
 **增量规则**：任何时候要更大范围（比如这次 30 天、下次 60 天），都只要把 `--days` 改大、`--existing` 指向长期库即可，已经下过的文件按「帖子文件夹 + 文件名」自动跳过，不会重复下载。
 
@@ -150,10 +152,7 @@ pwsh -File scripts\sync-to-d.ps1
 
 ## 状态（2026-10-27）
 
-已跑通真实环境：
-
-- 登录态验证通过（`.browser-profile` 持久化，重启浏览器仍有效）
-- 群组解析：3 个群组 id 全部正确
-- `download`：近 3 天 PDF 全部落盘，重复文件自动跳过
-- `export`：`系统技术` 近 3 天 **3 篇帖子 / 18 个附件 / 24.8 MB**，全部下载成功，0 失败；docx/pptx/zip 完整性校验通过
+- 登录态持久化有效，重启浏览器不用重扫
+- `export` 30 天全量：**36 篇帖子 / 198 个附件 / 401 MB，0 失败**；198 个文件全部通过完整性校验（zip/docx/pptx 无损坏、无 0 字节）
+- 长期库：`D:\知识星球下载\系统技术\`（36 个帖子文件夹 + `_manifest.json`）
 - 离线自检 3/3 通过

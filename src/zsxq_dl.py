@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """知识星球附件批量下载器（Playwright 本地版）。
 
 把 zsxq-pdf-downloader 技能的流程，从「Claude in Chrome 扩展手动点」改成本机脚本：
@@ -43,7 +43,7 @@ ROOT = Path(__file__).resolve().parent.parent
 PROFILE_DIR = ROOT / ".browser-profile"
 PROBE_DIR = ROOT / "probe"
 TMP_DIR = ROOT / ".tmp"
-DEFAULT_OUT = Path.home() / "Downloads" / "zsxq"
+DEFAULT_OUT = ROOT / "downloads"  # 本机沙箱只允许子进程写工作区，先落这里再搬出去
 HOME_URL = "https://wx.zsxq.com/"
 GROUP_URL = "https://wx.zsxq.com/group/{gid}"
 
@@ -64,6 +64,40 @@ TAG_FILES_JS = r"""
     out.push({idx: idx, text: t});
   });
   return out;
+}
+"""
+
+# 按帖子聚合：每篇的日期、标题（正文首行）、附件列表（带全局 idx，供点击使用）
+POSTS_JS = r"""
+() => {
+  const dateRe = /^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:\s+\d{1,2}:\d{2})?$/;
+  const cards = [...document.querySelectorAll('app-talk-content')];
+  let idx = 0;
+  const posts = [];
+  for (const card of cards) {
+    let box = card;
+    let dateEl = null;
+    for (let n = 0; n < 6 && box.parentElement; n++) {
+      box = box.parentElement;
+      dateEl = [...box.querySelectorAll('div,span')].find(e =>
+        e.children.length === 0 && dateRe.test((e.textContent || '').trim()));
+      if (dateEl) break;
+    }
+    const files = [...box.querySelectorAll('div.file-name')].map(el => {
+      const name = (el.textContent || '').trim();
+      el.setAttribute('data-zsxq-file', String(idx));
+      return {idx: idx++, name: name};
+    });
+    const text = (card.innerText || '').trim();
+    const title = text.split('\n').map(s => s.trim()).find(Boolean) || '无标题';
+    posts.push({
+      date: dateEl ? dateEl.textContent.trim() : '',
+      title: title,
+      text_len: text.length,
+      files: files,
+    });
+  }
+  return posts;
 }
 """
 
@@ -341,52 +375,67 @@ def oldest_date_on_page(page: Page) -> date | None:
 
 
 def scroll_until(page: Page, since: date | None, max_scrolls: int, pause: float) -> None:
-    log(f"滚动加载帖子（最多 {max_scrolls} 屏，since={since or '不限'}）……")
+    """滚到底加载更多。
+
+    实测：进群只加载 20 条帖子，必须滚到页面底部才会按 20 条/批追加；
+    「页面高度不变就停」会误判（离底部还远时高度当然不变），所以改为按帖子数增长判断。
+    """
+    log(f"滚动加载帖子（最多 {max_scrolls} 批，since={since or '不限'}）……")
+    count_js = "() => document.querySelectorAll('app-talk-content').length"
+    last_count = page.evaluate(count_js)
     stagnant = 0
-    last_height = 0
     for i in range(max_scrolls):
-        page.evaluate("window.scrollBy(0, 900)")
-        page.wait_for_timeout(int(pause * 1000))
-        height = page.evaluate("document.body.scrollHeight")
-        if height == last_height:
-            stagnant += 1
-            if stagnant >= 4:
-                log("页面高度不再增长，停止滚动。")
-                break
-        else:
-            stagnant = 0
-            last_height = height
-        if since and i >= 1:
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(max(int(pause * 1000), 1_800))
+        count = page.evaluate(count_js)
+        if since:
             oldest = oldest_date_on_page(page)
             if oldest and oldest < since:
-                log(f"已滚到 {oldest}，早于 {since}，停止滚动。")
-                break
+                log(f"已加载到 {oldest}，早于 {since}，停止滚动（共 {count} 篇）。")
+                return
+        if count > last_count:
+            log(f"  第 {i + 1} 批：帖子 {last_count} → {count}")
+            last_count, stagnant = count, 0
+        else:
+            stagnant += 1
+            if stagnant >= 3:
+                log(f"连续 3 批没有新帖子，停止（共 {count} 篇）。")
+                return
+    log(f"达到滚动上限，当前 {last_count} 篇。")
 
 
 def close_modal(page: Page) -> None:
-    """关掉「文件详情」弹窗。"""
-    if page.locator(DOWNLOAD_SELECTOR).count() == 0:
+    """关掉「文件详情」弹窗。
+
+    实测：下载完成后弹窗不会自动关，Escape 也无效（焦点可能被下载抢走），
+    残留的 .file-preview-container 会挡住后续所有点击。点遮罩容器才能可靠关闭。
+    """
+    if page.locator(".file-preview-container").count() == 0:
         return
-    page.keyboard.press("Escape")
-    try:
-        page.locator(DOWNLOAD_SELECTOR).first.wait_for(state="hidden", timeout=3_000)
-        return
-    except PWTimeout:
-        pass
-    for selector in ("i.icon-close", "[class*='close']", "button[aria-label*='关闭']"):
-        try:
-            page.locator(selector).first.click(timeout=1_500)
-            page.wait_for_timeout(500)
-            if page.locator(DOWNLOAD_SELECTOR).count() == 0:
-                return
-        except Exception:  # noqa: BLE001
-            continue
+    page.evaluate("() => { const c = document.querySelector('.file-preview-container'); if (c) c.click(); }")
+    for _ in range(10):
+        if page.locator(".file-preview-container").count() == 0:
+            page.wait_for_timeout(300)
+            return
+        page.wait_for_timeout(200)
+    # 兜底：直接摘掉残留节点
+    page.evaluate("() => document.querySelectorAll('app-file-preview').forEach(e => e.remove())")
     page.wait_for_timeout(300)
 
 
 def open_file_card(page: Page, idx: int, name_hint: str) -> bool:
-    """点开附件卡片。优先真实点击，被遮挡时退回 JS click。"""
+    """点开附件卡片。
+
+    Angular 滚动时会重建节点，自定义的 data 标记会丢，所以标记失效时按文件名精确匹配兜底。
+    """
     card = page.locator(f'[{TAG_ATTR}="{idx}"]')
+    if card.count() == 0:
+        exact = re.compile("^" + re.escape(name_hint.strip()) + "$")
+        card = page.locator("div.file-name").filter(has_text=exact).first
+        if card.count() == 0:
+            log(f"  ! {name_hint}：页面上找不到这个附件，跳过。")
+            return False
+
     try:
         card.scroll_into_view_if_needed(timeout=5_000)
     except PWError:
@@ -410,11 +459,18 @@ def download_one(page: Page, idx: int, name_hint: str, out_dir: Path, timeout_s:
 
     button = page.locator(DOWNLOAD_SELECTOR).first
     try:
-        button.wait_for(state="visible", timeout=10_000)
+        button.wait_for(state="visible", timeout=12_000)
     except PWTimeout:
-        log(f"  ! {name_hint}：弹窗里没有「下载文件」按钮，可能是内容保护，跳过。")
-        close_modal(page)
-        return None
+        # 卡片可能被点击到旧节点，再试一次
+        if open_file_card(page, idx, name_hint):
+            try:
+                button.wait_for(state="visible", timeout=12_000)
+            except PWTimeout:
+                log(f"  ! {name_hint}：弹窗里没有「下载文件」按钮，可能是内容保护，跳过。")
+                close_modal(page)
+                return None
+        else:
+            return None
 
     try:
         with page.expect_download(timeout=timeout_s * 1000) as info:
@@ -590,6 +646,154 @@ def cmd_download(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def post_folder_name(post: dict, used: set[str]) -> str:
+    """文件夹名：日期_标题前 60 字，重名自动加序号。"""
+    day = (post.get("date") or "")[:10]
+    title = re.sub(r'[\\/:*?"<>|\r\n\t]', " ", post.get("title") or "无标题")
+    title = re.sub(r"\s+", " ", title).strip()[:60].strip()
+    base = f"{day}_{title}" if day else title
+    name, n = base, 2
+    while name in used:
+        name = f"{base}_{n}"
+        n += 1
+    used.add(name)
+    return name
+
+
+def find_post(posts: list[dict], key: tuple) -> dict | None:
+    """按 (日期, 标题) 在最新一次抓取结果里找回同一篇帖子。"""
+    date, title = key
+    for post in posts:
+        if post.get("date") == date and post.get("title") == title:
+            return post
+    for post in posts:
+        if post.get("date") == date:
+            return post
+    return None
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    """按帖子导出：每篇一个文件夹，里面只放附件。
+
+    实测：同一个浏览器会话里连点几次后页面会进入「点不动」的状态
+    （弹窗残留 / 节点重建），所以按「尝试次数」计批次，到点就重启会话；
+    失败的文件放回队列，等下一次会话重试。
+    """
+    since = resolve_since(args)
+    exts = None if args.ext.strip() in ("*", "all", "") else [
+        e.strip() for e in args.ext.split(",") if e.strip()
+    ]
+    root = Path(args.out).expanduser() / (args.folder_name or args.group or args.group_id or "zsxq")
+    root.mkdir(parents=True, exist_ok=True)
+    log(f"输出目录：{root}")
+
+    used_names: set[str] = set()
+    done, skipped, failed = 0, 0, 0
+    total_bytes = 0
+    manifest: list[dict] = []
+
+    with sync_playwright() as pw:
+        def start_session():
+            ctx, page = launch(pw, headless=args.headless)
+            page = on_zsxq(page)
+            wait_for_login(page, args.wait)
+            open_group(page, args.group, args.group_id, args.group_url)
+            scroll_until(page, since, args.max_scrolls, args.pause)
+            return ctx, page, page.evaluate(POSTS_JS)
+
+        ctx, page, posts = start_session()
+        log(f"抓到 {len(posts)} 篇帖子。")
+
+        folder_by_key: dict[tuple, Path] = {}
+        queue: list[tuple[tuple, Path, str]] = []
+        for post in posts:
+            post_date = parse_date_label(post.get("date") or "")
+            if since and post_date and post_date < since:
+                continue
+            if not post.get("files"):
+                continue
+            key = (post.get("date"), post.get("title"))
+            folder = root / post_folder_name(post, used_names)
+            folder_by_key[key] = folder
+            for item in post["files"]:
+                if exts and not match_ext(item["name"], exts):
+                    continue
+                queue.append((key, folder, item["name"]))
+
+        log(f"待处理：{len(queue)} 个附件，分布在 {len(folder_by_key)} 篇帖子。")
+        for key, folder in folder_by_key.items():
+            folder.mkdir(parents=True, exist_ok=True)
+
+        pending: list[tuple[tuple, Path, str, int]] = [(k, f, n, 0) for k, f, n in queue]
+        attempts_in_session = 0
+        total = len(pending)
+        index = 0
+
+        while pending:
+            key, folder, name, tries = pending.pop(0)
+            index += 1
+            target = folder / sanitize(name)
+            if target.exists() and not args.force:
+                skipped += 1
+                manifest.append({"folder": folder.name, "name": name, "status": "skipped"})
+                continue
+
+            if attempts_in_session >= args.batch:
+                ctx.close()
+                ctx, page, posts = start_session()
+                attempts_in_session = 0
+                log(f"  （重启会话，继续第 {index}/{total} 个）")
+
+            current = find_post(posts, key)
+            item = None
+            for cand in (current or {}).get("files") or []:
+                if cand["name"] == name:
+                    item = cand
+                    break
+
+            saved = None
+            if item is not None:
+                try:
+                    saved = download_one(page, item["idx"], name, folder, args.timeout)
+                except Exception as exc:  # noqa: BLE001
+                    log(f"    ! {name}：{type(exc).__name__}: {str(exc)[:80]}")
+                    try:
+                        close_modal(page)
+                    except Exception:  # noqa: BLE001
+                        pass
+            attempts_in_session += 1
+
+            if saved:
+                done += 1
+                total_bytes += saved.stat().st_size
+                manifest.append({"folder": folder.name, "name": saved.name, "status": "downloaded"})
+                log(f"    ✓ {saved.name}（{saved.stat().st_size / 1024:.0f} KB）  [{index}/{total}]")
+            else:
+                if tries < args.retries:
+                    pending.append((key, folder, name, tries + 1))
+                    attempts_in_session = args.batch  # 让下一轮立刻重启
+                    if item is None:
+                        log(f"    ↻ {name}：当前会话找不到，重启后重试")
+                    else:
+                        log(f"    ↻ {name}：本次失败，重启后重试（第 {tries + 1} 次）")
+                else:
+                    failed += 1
+                    manifest.append({"folder": folder.name, "name": name, "status": "failed"})
+                    log(f"    ✗ {name}：重试 {args.retries} 次仍失败")
+            page.wait_for_timeout(args.delay * 1000)
+
+        ctx.close()
+
+    (root / "_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    log("\n===== 汇总 =====")
+    log(f"附件 {total} 个 | 新增 {done} | 跳过 {skipped} | 失败 {failed}")
+    log(f"本次下载 {total_bytes / 1024 / 1024:.1f} MB → {root}")
+    log(f"清单：{root / '_manifest.json'}")
+    return 0 if failed == 0 else 1
+
+
 def cmd_dry_run(args: argparse.Namespace) -> int:
     since = resolve_since(args)
     exts = [e.strip() for e in args.ext.split(",") if e.strip()]
@@ -659,6 +863,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_dry = sub.add_parser("dry-run", help="只列出识别到的附件，不下载")
     add_common(p_dry)
     p_dry.set_defaults(func=cmd_dry_run)
+
+    p_exp = sub.add_parser("export", help="按帖子导出：每篇一个文件夹，只放附件")
+    p_exp.add_argument("--group", help="群组名（模糊匹配）")
+    p_exp.add_argument("--group-id", help="群组 id（URL 里的数字，最稳）")
+    p_exp.add_argument("--group-url", help="群组完整链接")
+    p_exp.add_argument("--days", type=int, default=7, help="只处理最近 N 天（默认 7）")
+    p_exp.add_argument("--since", help="起始日期 YYYY-MM-DD，优先于 --days")
+    p_exp.add_argument("--ext", default="*", help="附件类型过滤，默认 * 全部")
+    p_exp.add_argument("--out", default=str(DEFAULT_OUT), help="根目录（默认 ~/Downloads/zsxq）")
+    p_exp.add_argument("--folder-name", help="群组子目录名，默认用群组名")
+    p_exp.add_argument("--max-scrolls", type=int, default=60, help="最多滚动多少批")
+    p_exp.add_argument("--pause", type=float, default=2.0, help="每批等待秒数")
+    p_exp.add_argument("--wait", type=int, default=600, help="等待登录的秒数")
+    p_exp.add_argument("--timeout", type=int, default=90, help="单个文件下载超时秒数")
+    p_exp.add_argument("--delay", type=float, default=1.0, help="每个文件之间的间隔秒数")
+    p_exp.add_argument("--batch", type=int, default=3, help="每尝试 N 个文件重启一次会话（默认 3）")
+    p_exp.add_argument("--retries", type=int, default=2, help="单个文件最多重试次数（默认 2）")
+    p_exp.add_argument("--force", action="store_true", help="已存在也重新下载")
+    p_exp.add_argument("--headless", action="store_true", help="无头模式")
+    p_exp.set_defaults(func=cmd_export)
     return parser
 
 

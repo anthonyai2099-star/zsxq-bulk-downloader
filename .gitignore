@@ -6,3 +6,5 @@ __pycache__/
 downloads/
 .tmp/
 pip-install*.log
+downloads/
+

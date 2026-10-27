@@ -697,7 +697,7 @@ def cmd_export(args: argparse.Namespace) -> int:
     existing_roots = [Path(e).expanduser() for e in args.existing]
     if existing_roots:
         log("已存在目录（命中则跳过）：" + "、".join(str(r) for r in existing_roots))
-    words = parse_words(args.match)
+    words = resolve_words(args)
     skip_words = parse_words(args.skip)
     if words:
         log(f"只下载匹配关键字的帖子：{words}（{'全部命中' if args.match_all else '任一命中'}）")
@@ -815,6 +815,26 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0 if failed == 0 else 1
 
 
+def load_profile(path: str, only: list[str] | None = None) -> list[str]:
+    data = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    groups = data.get("groups") or {}
+    keys = only or data.get("default") or list(groups)
+    words: list[str] = []
+    for key in keys:
+        words.extend((groups.get(key) or {}).get("keywords") or [])
+    return words
+
+
+def resolve_words(args: argparse.Namespace) -> list[str]:
+    """命令行 --match 与偏好文件（topics.json）合并去重。"""
+    words = parse_words(getattr(args, "match", None))
+    profile = getattr(args, "profile", None)
+    if profile and Path(profile).expanduser().exists():
+        only = parse_words(getattr(args, "only", None)) or None
+        words += load_profile(profile, only)
+    return list(dict.fromkeys(words))
+
+
 def parse_words(raw: str | None) -> list[str]:
     return [w.strip() for w in (raw or "").replace("，", ",").split(",") if w.strip()]
 
@@ -846,7 +866,7 @@ def dedupe_posts(posts: list[dict]) -> list[dict]:
 def cmd_search(args: argparse.Namespace) -> int:
     """只扫描不下载：列出匹配关键字的帖子，用于挑选要下载的内容。"""
     since = resolve_since(args)
-    words = parse_words(args.match)
+    words = resolve_words(args)
     with sync_playwright() as pw:
         ctx, page = launch(pw, headless=True)
         page = on_zsxq(page)
@@ -963,6 +983,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("--match", help="关键字，逗号分隔（标题+正文匹配）")
     p_search.add_argument("--match-all", action="store_true", help="要求全部关键字命中")
     p_search.add_argument("--title-only", action="store_true", help="只匹配标题（更精准）")
+    p_search.add_argument("--profile", default=str(ROOT / "topics.json"), help="偏好关键字文件（默认 topics.json）")
+    p_search.add_argument("--only", help="只启用偏好文件里的哪几组，逗号分隔")
     p_search.add_argument("--max-scrolls", type=int, default=60, help="最多滚动多少批")
     p_search.add_argument("--pause", type=float, default=2.0, help="每批等待秒数")
     p_search.add_argument("--wait", type=int, default=600, help="等待登录的秒数")
@@ -984,6 +1006,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_exp.add_argument("--match-all", action="store_true", help="要求全部关键字命中")
     p_exp.add_argument("--title-only", action="store_true", help="只匹配标题（更精准）")
     p_exp.add_argument("--skip", help="标题含这些词的帖子跳过，逗号分隔")
+    p_exp.add_argument("--profile", default=str(ROOT / "topics.json"), help="偏好关键字文件（默认 topics.json）")
+    p_exp.add_argument("--only", help="只启用偏好文件里的哪几组，逗号分隔")
     p_exp.add_argument("--max-scrolls", type=int, default=60, help="最多滚动多少批")
     p_exp.add_argument("--pause", type=float, default=2.0, help="每批等待秒数")
     p_exp.add_argument("--wait", type=int, default=600, help="等待登录的秒数")

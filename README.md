@@ -102,6 +102,22 @@ downloads/系统技术/
 
 `search` 的输出是 `日期 | 附件数 | 标题`，可以直接挑；要排除某几篇就用 `--skip` 传标题里的特征词。
 
+## 偏好（长期有效）
+
+**先读 [preferences.md](preferences.md)**：宏观战略 / 战法 / 作战概念优先级最高，不能以「偏战略、和装备无关」为由排除；其次是成体系的装备技术。
+
+关键字集合在 [topics.json](topics.json)，分组维护（`macro` 组标了 `priority: high`）。筛帖时直接吃这套配置：
+
+```powershell
+# 用默认偏好（宏观 + 反无人机 + 空中 + 海上 + 精确打击）
+.\.venv\Scripts\python.exe src\zsxq_dl.py search --group "系统技术" --days 90 --title-only
+
+# 只启用其中几组
+.\.venv\Scripts\python.exe src\zsxq_dl.py search --group "系统技术" --days 90 --title-only --only macro,uav
+```
+
+`--match` 的临时关键字会和 `--profile` 合并去重，所以「固定偏好 + 临时加词」可以一起用。
+
 ## 长期存放与增量下载（重要约定）
 
 **长期库固定在 `D:\知识星球下载\<群组名>\`**，这是唯一需要备份的地方。

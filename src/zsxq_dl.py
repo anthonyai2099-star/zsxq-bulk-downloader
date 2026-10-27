@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """知识星球附件批量下载器（Playwright 本地版）。
 
 把 zsxq-pdf-downloader 技能的流程，从「Claude in Chrome 扩展手动点」改成本机脚本：
@@ -378,16 +378,19 @@ def oldest_date_on_page(page: Page) -> date | None:
 def scroll_until(page: Page, since: date | None, max_scrolls: int, pause: float) -> None:
     """滚到底加载更多。
 
-    实测：进群只加载 20 条帖子，必须滚到页面底部才会按 20 条/批追加；
-    「页面高度不变就停」会误判（离底部还远时高度当然不变），所以改为按帖子数增长判断。
+    实测：进群只加载 20 条，滚到接近底部后每批追加 20 条，但服务端很慢
+    （新一批常要 5~10 秒），只等 2 秒会误判成「没有新帖子」。
+    所以同时发真实滚轮事件 + scrollTo，并给足等待时间。
     """
     log(f"滚动加载帖子（最多 {max_scrolls} 批，since={since or '不限'}）……")
     count_js = "() => document.querySelectorAll('app-talk-content').length"
     last_count = page.evaluate(count_js)
     stagnant = 0
     for i in range(max_scrolls):
+        page.mouse.move(700, 500)
+        page.mouse.wheel(0, 3_000)
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(max(int(pause * 1000), 1_800))
+        page.wait_for_timeout(max(int(pause * 1000), 4_000))
         count = page.evaluate(count_js)
         if since:
             oldest = oldest_date_on_page(page)
@@ -399,11 +402,32 @@ def scroll_until(page: Page, since: date | None, max_scrolls: int, pause: float)
             last_count, stagnant = count, 0
         else:
             stagnant += 1
-            if stagnant >= 3:
-                log(f"连续 3 批没有新帖子，停止（共 {count} 篇）。")
+            if stagnant >= 5:
+                log(f"连续 5 批没有新帖子，停止（共 {count} 篇）。")
                 return
     log(f"达到滚动上限，当前 {last_count} 篇。")
 
+
+def ensure_range(page: Page, since: date | None, pause: float = 2.0, rounds: int = 4) -> None:
+    """确保信息流真的加载到 since 之前。
+
+    帖子多时（90 天 ≈ 120 篇）知识星球会加载不全，只滚到二三十篇就停，
+    后续按日期找帖子会全部落空，所以这里多滚几轮，实在加载不到就明确报错。
+    """
+    oldest = None
+    for round_no in range(1, rounds + 1):
+        scroll_until(page, since, 60, pause)
+        if not since:
+            return
+        oldest = oldest_date_on_page(page)
+        if oldest and oldest < since:
+            return
+        log(f"  信息流只加载到 {oldest or '未知'}，再滚一轮（{round_no}/{rounds}）……")
+        page.wait_for_timeout(3_000)
+    raise SystemExit(
+        f"信息流加载不到 {since} 之前（最旧只到 {oldest}）。"
+        f"请把时间范围拆小（例如用 --since / --until 分两段）后重试。"
+    )
 
 def close_modal(page: Page) -> None:
     """关掉「文件详情」弹窗。
@@ -573,6 +597,13 @@ def cmd_probe(args: argparse.Namespace) -> int:
     return 0
 
 
+def resolve_until(args: argparse.Namespace) -> date | None:
+    raw = getattr(args, "until", None)
+    if not raw:
+        return None
+    return datetime.strptime(raw, "%Y-%m-%d").date()
+
+
 def resolve_since(args: argparse.Namespace) -> date | None:
     if getattr(args, "since", None):
         return datetime.strptime(args.since, "%Y-%m-%d").date()
@@ -662,13 +693,17 @@ def post_folder_name(post: dict, used: set[str]) -> str:
 
 
 def find_post(posts: list[dict], key: tuple) -> dict | None:
-    """按 (日期, 标题) 在最新一次抓取结果里找回同一篇帖子。"""
+    """按 (日期, 标题) 在最新一次抓取结果里找回同一篇帖子。
+
+    key 里的日期是 YYYY-MM-DD，帖子里的 date 带时间（YYYY-MM-DD HH:MM），比较时只取日期部分。
+    """
     date, title = key
+    day = (date or "")[:10]
     for post in posts:
-        if post.get("date") == date and post.get("title") == title:
+        if (post.get("date") or "")[:10] == day and post.get("title") == title:
             return post
     for post in posts:
-        if post.get("date") == date:
+        if (post.get("date") or "")[:10] == day:
             return post
     return None
 
@@ -688,6 +723,7 @@ def cmd_export(args: argparse.Namespace) -> int:
     失败的文件放回队列，等下一次会话重试。
     """
     since = resolve_since(args)
+    until = resolve_until(args)
     exts = None if args.ext.strip() in ("*", "all", "") else [
         e.strip() for e in args.ext.split(",") if e.strip()
     ]
@@ -713,7 +749,7 @@ def cmd_export(args: argparse.Namespace) -> int:
             page = on_zsxq(page)
             wait_for_login(page, args.wait)
             open_group(page, args.group, args.group_id, args.group_url)
-            scroll_until(page, since, args.max_scrolls, args.pause)
+            ensure_range(page, since, args.pause)
             return ctx, page, page.evaluate(POSTS_JS)
 
         ctx, page, posts = start_session()
@@ -726,6 +762,8 @@ def cmd_export(args: argparse.Namespace) -> int:
         for post in posts:
             post_date = parse_date_label(post.get("date") or "")
             if since and post_date and post_date < since:
+                continue
+            if until and post_date and post_date > until:
                 continue
             if not post.get("files"):
                 continue
@@ -772,16 +810,22 @@ def cmd_export(args: argparse.Namespace) -> int:
                     item = cand
                     break
 
+            if item is None:
+                # 当前会话没加载到这篇帖子：不要重启重试（会无限循环），直接记失败
+                failed += 1
+                manifest.append({"folder": folder.name, "name": name, "status": "failed", "reason": "not_loaded"})
+                log(f"    ✗ {name}：当前会话没加载到这篇帖子")
+                continue
+
             saved = None
-            if item is not None:
+            try:
+                saved = download_one(page, item["idx"], name, folder, args.timeout)
+            except Exception as exc:  # noqa: BLE001
+                log(f"    ! {name}：{type(exc).__name__}: {str(exc)[:80]}")
                 try:
-                    saved = download_one(page, item["idx"], name, folder, args.timeout)
-                except Exception as exc:  # noqa: BLE001
-                    log(f"    ! {name}：{type(exc).__name__}: {str(exc)[:80]}")
-                    try:
-                        close_modal(page)
-                    except Exception:  # noqa: BLE001
-                        pass
+                    close_modal(page)
+                except Exception:  # noqa: BLE001
+                    pass
             attempts_in_session += 1
 
             if saved:
@@ -793,10 +837,7 @@ def cmd_export(args: argparse.Namespace) -> int:
                 if tries < args.retries:
                     pending.append((key, folder, name, tries + 1))
                     attempts_in_session = args.batch  # 让下一轮立刻重启
-                    if item is None:
-                        log(f"    ↻ {name}：当前会话找不到，重启后重试")
-                    else:
-                        log(f"    ↻ {name}：本次失败，重启后重试（第 {tries + 1} 次）")
+                    log(f"    ↻ {name}：本次失败，重启后重试（第 {tries + 1} 次）")
                 else:
                     failed += 1
                     manifest.append({"folder": folder.name, "name": name, "status": "failed"})
@@ -866,13 +907,14 @@ def dedupe_posts(posts: list[dict]) -> list[dict]:
 def cmd_search(args: argparse.Namespace) -> int:
     """只扫描不下载：列出匹配关键字的帖子，用于挑选要下载的内容。"""
     since = resolve_since(args)
+    until = resolve_until(args)
     words = resolve_words(args)
     with sync_playwright() as pw:
         ctx, page = launch(pw, headless=True)
         page = on_zsxq(page)
         wait_for_login(page, args.wait)
         open_group(page, args.group, args.group_id, args.group_url)
-        scroll_until(page, since, args.max_scrolls, args.pause)
+        ensure_range(page, since, args.pause)
         posts = dedupe_posts(page.evaluate(POSTS_JS))
         ctx.close()
 
@@ -881,9 +923,27 @@ def cmd_search(args: argparse.Namespace) -> int:
         post_date = parse_date_label(post.get("date") or "")
         if since and post_date and post_date < since:
             continue
+        if until and post_date and post_date > until:
+            continue
         if not post_matches(post, words, args.match_all, args.title_only):
             continue
         rows.append(post)
+
+    # 偏好：宏观战略类排前面
+    macro_words: list[str] = []
+    profile = getattr(args, "profile", None)
+    if profile and Path(profile).expanduser().exists():
+        try:
+            data = json.loads(Path(profile).expanduser().read_text(encoding="utf-8"))
+            macro_words = ((data.get("groups") or {}).get("macro") or {}).get("keywords") or []
+        except Exception:  # noqa: BLE001
+            macro_words = []
+
+    def is_macro(post: dict) -> bool:
+        title = (post.get("title") or "").lower()
+        return any(w.lower() in title for w in macro_words)
+
+    rows.sort(key=lambda p: (0 if is_macro(p) else 1, -int((p.get("date") or "1970-01-01")[:10].replace("-", "") or 0)))
 
     total_files = sum(len(p["files"]) for p in rows)
     log(f"匹配 {len(rows)} 篇帖子，共 {total_files} 个附件（关键字：{words or '无'}）：")
@@ -980,6 +1040,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("--group-url", help="群组完整链接")
     p_search.add_argument("--days", type=int, default=30, help="只搜最近 N 天（默认 30）")
     p_search.add_argument("--since", help="起始日期 YYYY-MM-DD，优先于 --days")
+    p_search.add_argument("--until", help="截止日期 YYYY-MM-DD（含）")
     p_search.add_argument("--match", help="关键字，逗号分隔（标题+正文匹配）")
     p_search.add_argument("--match-all", action="store_true", help="要求全部关键字命中")
     p_search.add_argument("--title-only", action="store_true", help="只匹配标题（更精准）")
@@ -997,6 +1058,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_exp.add_argument("--group-url", help="群组完整链接")
     p_exp.add_argument("--days", type=int, default=7, help="只处理最近 N 天（默认 7）")
     p_exp.add_argument("--since", help="起始日期 YYYY-MM-DD，优先于 --days")
+    p_exp.add_argument("--until", help="截止日期 YYYY-MM-DD（含）")
     p_exp.add_argument("--ext", default="*", help="附件类型过滤，默认 * 全部")
     p_exp.add_argument("--out", default=str(DEFAULT_OUT), help="根目录（默认 downloads/）")
     p_exp.add_argument("--existing", action="append", default=[],

@@ -80,6 +80,27 @@ downloads/系统技术/
 | `--delay` | 每个文件之间的间隔秒数 |
 | `--out DIR` | 根目录，默认 `downloads/` |
 | `--existing DIR` | 已下载目录，命中同名文件就跳过（可重复，增量补跑用） |
+| `--match k1,k2` | 只下载标题/正文命中关键字的帖子（逗号分隔，默认任一命中） |
+| `--match-all` | 要求全部关键字命中 |
+| `--title-only` | 只匹配标题，避免正文随口提一句也被算进来 |
+| `--skip k1,k2` | 标题含这些词的帖子跳过 |
+
+## 按兴趣筛选下载
+
+内容太多时先搜后下，`search` 只扫描不下载：
+
+```powershell
+# 90 天里标题含「无人机 / 防空 / 航母」的帖子，只列清单
+.\.venv\Scripts\python.exe src\zsxq_dl.py search --group "系统技术" --days 90 `
+  --match "无人机,防空,航母" --title-only --out search.json
+
+# 确认后只下这些主题
+.\.venv\Scripts\python.exe src\zsxq_dl.py export --group "系统技术" --days 90 `
+  --match "无人机,防空,航母" --title-only `
+  --out "D:\CLAUDE-CODE\Text\_exports\zsxq" --existing "D:\知识星球下载\系统技术"
+```
+
+`search` 的输出是 `日期 | 附件数 | 标题`，可以直接挑；要排除某几篇就用 `--skip` 传标题里的特征词。
 
 ## 长期存放与增量下载（重要约定）
 

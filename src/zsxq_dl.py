@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """知识星球附件批量下载器（Playwright 本地版）。
 
 把 zsxq-pdf-downloader 技能的流程，从「Claude in Chrome 扩展手动点」改成本机脚本：
@@ -93,6 +93,7 @@ POSTS_JS = r"""
     posts.push({
       date: dateEl ? dateEl.textContent.trim() : '',
       title: title,
+      text: text,
       text_len: text.length,
       files: files,
     });
@@ -696,6 +697,10 @@ def cmd_export(args: argparse.Namespace) -> int:
     existing_roots = [Path(e).expanduser() for e in args.existing]
     if existing_roots:
         log("已存在目录（命中则跳过）：" + "、".join(str(r) for r in existing_roots))
+    words = parse_words(args.match)
+    skip_words = parse_words(args.skip)
+    if words:
+        log(f"只下载匹配关键字的帖子：{words}（{'全部命中' if args.match_all else '任一命中'}）")
 
     used_names: set[str] = set()
     done, skipped, failed = 0, 0, 0
@@ -712,17 +717,24 @@ def cmd_export(args: argparse.Namespace) -> int:
             return ctx, page, page.evaluate(POSTS_JS)
 
         ctx, page, posts = start_session()
+        posts = dedupe_posts(posts)
         log(f"抓到 {len(posts)} 篇帖子。")
 
         folder_by_key: dict[tuple, Path] = {}
         queue: list[tuple[tuple, Path, str]] = []
+        matched_posts = 0
         for post in posts:
             post_date = parse_date_label(post.get("date") or "")
             if since and post_date and post_date < since:
                 continue
             if not post.get("files"):
                 continue
-            key = (post.get("date"), post.get("title"))
+            if not post_matches(post, words, args.match_all, args.title_only):
+                continue
+            if skip_words and any(w.lower() in (post.get("title") or "").lower() for w in skip_words):
+                continue
+            matched_posts += 1
+            key = ((post.get("date") or "")[:10], post.get("title"))
             folder = root / post_folder_name(post, used_names)
             folder_by_key[key] = folder
             for item in post["files"]:
@@ -730,7 +742,7 @@ def cmd_export(args: argparse.Namespace) -> int:
                     continue
                 queue.append((key, folder, item["name"]))
 
-        log(f"待处理：{len(queue)} 个附件，分布在 {len(folder_by_key)} 篇帖子。")
+        log(f"待处理：{len(queue)} 个附件，分布在 {matched_posts} 篇帖子。")
         for key, folder in folder_by_key.items():
             folder.mkdir(parents=True, exist_ok=True)
 
@@ -803,6 +815,75 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0 if failed == 0 else 1
 
 
+def parse_words(raw: str | None) -> list[str]:
+    return [w.strip() for w in (raw or "").replace("，", ",").split(",") if w.strip()]
+
+
+def post_matches(
+    post: dict, words: list[str], match_all: bool = False, title_only: bool = False
+) -> bool:
+    """标题（可选正文）里做关键字匹配；match_all 时要求全部命中。"""
+    if not words:
+        return True
+    hay = post.get("title", "")
+    if not title_only:
+        hay += "\n" + post.get("text", "")
+    hay = hay.lower()
+    hits = [w.lower() in hay for w in words]
+    return all(hits) if match_all else any(hits)
+
+
+def dedupe_posts(posts: list[dict]) -> list[dict]:
+    """同一篇帖子在 DOM 里偶尔重复出现，保留附件最多的那份。"""
+    best: dict[tuple, dict] = {}
+    for post in posts:
+        key = ((post.get("date") or "")[:10], post.get("title"))
+        if key not in best or len(post.get("files") or []) > len(best[key].get("files") or []):
+            best[key] = post
+    return list(best.values())
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    """只扫描不下载：列出匹配关键字的帖子，用于挑选要下载的内容。"""
+    since = resolve_since(args)
+    words = parse_words(args.match)
+    with sync_playwright() as pw:
+        ctx, page = launch(pw, headless=True)
+        page = on_zsxq(page)
+        wait_for_login(page, args.wait)
+        open_group(page, args.group, args.group_id, args.group_url)
+        scroll_until(page, since, args.max_scrolls, args.pause)
+        posts = dedupe_posts(page.evaluate(POSTS_JS))
+        ctx.close()
+
+    rows = []
+    for post in posts:
+        post_date = parse_date_label(post.get("date") or "")
+        if since and post_date and post_date < since:
+            continue
+        if not post_matches(post, words, args.match_all, args.title_only):
+            continue
+        rows.append(post)
+
+    total_files = sum(len(p["files"]) for p in rows)
+    log(f"匹配 {len(rows)} 篇帖子，共 {total_files} 个附件（关键字：{words or '无'}）：")
+    for post in rows:
+        log(f"  {post['date'][:10]}  [{len(post['files'])} 个]  {post['title'][:70]}")
+
+    out = Path(args.out).expanduser() if args.out else TMP_DIR / "search.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(
+        json.dumps(
+            [{"date": p["date"], "title": p["title"], "files": [f["name"] for f in p["files"]]} for p in rows],
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    log(f"清单已写入：{out}")
+    return 0
+
+
 def cmd_dry_run(args: argparse.Namespace) -> int:
     since = resolve_since(args)
     exts = [e.strip() for e in args.ext.split(",") if e.strip()]
@@ -873,6 +954,21 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(p_dry)
     p_dry.set_defaults(func=cmd_dry_run)
 
+    p_search = sub.add_parser("search", help="按关键字搜帖子，只列清单不下载")
+    p_search.add_argument("--group", help="群组名（模糊匹配）")
+    p_search.add_argument("--group-id", help="群组 id（URL 里的数字，最稳）")
+    p_search.add_argument("--group-url", help="群组完整链接")
+    p_search.add_argument("--days", type=int, default=30, help="只搜最近 N 天（默认 30）")
+    p_search.add_argument("--since", help="起始日期 YYYY-MM-DD，优先于 --days")
+    p_search.add_argument("--match", help="关键字，逗号分隔（标题+正文匹配）")
+    p_search.add_argument("--match-all", action="store_true", help="要求全部关键字命中")
+    p_search.add_argument("--title-only", action="store_true", help="只匹配标题（更精准）")
+    p_search.add_argument("--max-scrolls", type=int, default=60, help="最多滚动多少批")
+    p_search.add_argument("--pause", type=float, default=2.0, help="每批等待秒数")
+    p_search.add_argument("--wait", type=int, default=600, help="等待登录的秒数")
+    p_search.add_argument("--out", help="结果 JSON 路径，默认 .tmp/search.json")
+    p_search.set_defaults(func=cmd_search)
+
     p_exp = sub.add_parser("export", help="按帖子导出：每篇一个文件夹，只放附件")
     p_exp.add_argument("--group", help="群组名（模糊匹配）")
     p_exp.add_argument("--group-id", help="群组 id（URL 里的数字，最稳）")
@@ -884,6 +980,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_exp.add_argument("--existing", action="append", default=[],
                        help="已下载的目录，命中同名文件则跳过（可重复，用于增量补跑）")
     p_exp.add_argument("--folder-name", help="群组子目录名，默认用群组名")
+    p_exp.add_argument("--match", help="只下载匹配关键字的帖子，逗号分隔（标题+正文匹配）")
+    p_exp.add_argument("--match-all", action="store_true", help="要求全部关键字命中")
+    p_exp.add_argument("--title-only", action="store_true", help="只匹配标题（更精准）")
+    p_exp.add_argument("--skip", help="标题含这些词的帖子跳过，逗号分隔")
     p_exp.add_argument("--max-scrolls", type=int, default=60, help="最多滚动多少批")
     p_exp.add_argument("--pause", type=float, default=2.0, help="每批等待秒数")
     p_exp.add_argument("--wait", type=int, default=600, help="等待登录的秒数")

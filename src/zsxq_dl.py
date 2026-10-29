@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """知识星球附件批量下载器（Playwright 本地版）。
 
 把 zsxq-pdf-downloader 技能的流程，从「Claude in Chrome 扩展手动点」改成本机脚本：
@@ -308,10 +308,18 @@ def open_group(
     else:
         if not group_id and group:
             log(f"在左侧列表里查找群组：{group}")
-            groups = list_groups(page)
-            matched = [g for g in groups if group in g["name"]]
+            # 侧栏可能比信息流晚渲染，等一会儿再判定
+            deadline = time.time() + 20
+            groups: list[dict] = []
+            matched: list[dict] = []
+            while time.time() < deadline:
+                groups = list_groups(page)
+                matched = [g for g in groups if group in (g.get("name") or "")]
+                if matched:
+                    break
+                page.wait_for_timeout(1_500)
             if not matched:
-                available = "、".join(g["name"] for g in groups[:12]) or "（没读到列表）"
+                available = "、".join((g.get("name") or "") for g in groups[:12]) or "（没读到列表）"
                 raise SystemExit(
                     f"没找到群组「{group}」。可用的有：{available}\n"
                     f"也可以用 --group-id 直接指定。"
@@ -415,7 +423,15 @@ def ensure_range(page: Page, since: date | None, pause: float = 2.0, rounds: int
     后续按日期找帖子会全部落空，所以这里多滚几轮，实在加载不到就明确报错。
     """
     oldest = None
+    count_js = "() => document.querySelectorAll('app-talk-content').length"
     for round_no in range(1, rounds + 1):
+        if page.evaluate(count_js) == 0:
+            log("  页面没渲染出帖子，重新加载……")
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=60_000)
+                wait_for_app_ready(page, timeout_s=30)
+            except PWError:
+                pass
         scroll_until(page, since, 60, pause)
         if not since:
             return
@@ -692,6 +708,27 @@ def post_folder_name(post: dict, used: set[str]) -> str:
     return name
 
 
+def find_file(posts: list[dict], key: tuple, name: str) -> dict | None:
+    """在抓取结果里按「日期 + 标题 + 文件名」找附件卡片。
+
+    同一天可能有同名帖子（重发/残帖），所以不能只按日期取第一篇。
+    """
+    day, title = (key[0] or "")[:10], key[1]
+    for post in posts:
+        if (post.get("date") or "")[:10] != day or post.get("title") != title:
+            continue
+        for f in post.get("files") or []:
+            if f["name"] == name:
+                return f
+    for post in posts:
+        if (post.get("date") or "")[:10] != day:
+            continue
+        for f in post.get("files") or []:
+            if f["name"] == name:
+                return f
+    return None
+
+
 def find_post(posts: list[dict], key: tuple) -> dict | None:
     """按 (日期, 标题) 在最新一次抓取结果里找回同一篇帖子。
 
@@ -713,6 +750,19 @@ def already_have(folder_name: str, filename: str, root: Path, existing_roots: li
     if (root / folder_name / filename).exists():
         return True
     return any((base / folder_name / filename).exists() for base in existing_roots)
+
+
+def start_session_with_retry(fn, attempts: int = 8, delay: int = 15):
+    """网络抖一下（DNS/超时）不该让整批任务挂掉，失败就退避重试。"""
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except BaseException as exc:  # noqa: BLE001 - 浏览器启动失败也是 SystemExit，一并重试
+            last = exc
+            log(f"  会话启动失败（{type(exc).__name__}: {str(exc)[:70]}），{delay}s 后重试（{i + 1}/{attempts}）")
+            time.sleep(delay)
+    raise last  # type: ignore[misc]
 
 
 def cmd_export(args: argparse.Namespace) -> int:
@@ -752,7 +802,7 @@ def cmd_export(args: argparse.Namespace) -> int:
             ensure_range(page, since, args.pause)
             return ctx, page, page.evaluate(POSTS_JS)
 
-        ctx, page, posts = start_session()
+        ctx, page, posts = start_session_with_retry(start_session)
         posts = dedupe_posts(posts)
         log(f"抓到 {len(posts)} 篇帖子。")
 
@@ -799,16 +849,11 @@ def cmd_export(args: argparse.Namespace) -> int:
 
             if attempts_in_session >= args.batch:
                 ctx.close()
-                ctx, page, posts = start_session()
+                ctx, page, posts = start_session_with_retry(start_session)
                 attempts_in_session = 0
                 log(f"  （重启会话，继续第 {index}/{total} 个）")
 
-            current = find_post(posts, key)
-            item = None
-            for cand in (current or {}).get("files") or []:
-                if cand["name"] == name:
-                    item = cand
-                    break
+            item = find_file(posts, key, name)
 
             if item is None:
                 # 当前会话没加载到这篇帖子：不要重启重试（会无限循环），直接记失败

@@ -162,6 +162,12 @@ def launch(pw, headless: bool = False) -> tuple[BrowserContext, Page]:
     """启动持久化 profile 的浏览器；优先本机 Edge，失败再退回 Chromium。"""
     ensure_temp_dir()
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    # 上次异常退出可能留下 profile 锁，导致 Edge 启动即退出（exitCode=21）
+    for lock in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        try:
+            (PROFILE_DIR / lock).unlink()
+        except OSError:
+            pass
     common = dict(
         user_data_dir=str(PROFILE_DIR),
         headless=headless,
@@ -392,6 +398,10 @@ def scroll_until(page: Page, since: date | None, max_scrolls: int, pause: float)
     """
     log(f"滚动加载帖子（最多 {max_scrolls} 批，since={since or '不限'}）……")
     count_js = "() => document.querySelectorAll('app-talk-content').length"
+    # 页面可能还没挂载出帖子，先等它渲染
+    deadline = time.time() + 20
+    while time.time() < deadline and page.evaluate(count_js) == 0:
+        page.wait_for_timeout(1_000)
     last_count = page.evaluate(count_js)
     stagnant = 0
     for i in range(max_scrolls):
@@ -752,7 +762,7 @@ def already_have(folder_name: str, filename: str, root: Path, existing_roots: li
     return any((base / folder_name / filename).exists() for base in existing_roots)
 
 
-def start_session_with_retry(fn, attempts: int = 8, delay: int = 15):
+def start_session_with_retry(fn, attempts: int = 10, delay: int = 20):
     """网络抖一下（DNS/超时）不该让整批任务挂掉，失败就退避重试。"""
     last = None
     for i in range(attempts):

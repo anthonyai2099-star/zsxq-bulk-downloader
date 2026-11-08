@@ -49,6 +49,10 @@ python -m venv .venv
 .\.venv\Scripts\python.exe src\zsxq_dl.py export --group "系统技术" --days 30 --out .\downloads
 ```
 
+运行时的样子（失败项会自动重启会话重试，最后给汇总）：
+
+![命令行输出](docs/cli-output.png)
+
 ## 输出结构
 
 ```
@@ -60,6 +64,8 @@ downloads/系统技术/
 ├── 2026-10-25_俄罗斯菲林喷气推进巡航导弹技术特征解析/
 └── _manifest.json     # 每个附件的记录：所属文件夹、文件名、大小
 ```
+
+![归档结构](docs/library-structure.png)
 
 ## 命令一览
 

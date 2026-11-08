@@ -1,11 +1,11 @@
-# Changelog
+﻿# Changelog
 
 本项目从一份 Claude Skill 改造而来，按使用中踩到的坑逐步演进。
 
 ## 2026-11-09
 
 - 增量补漏：扫描 2026-09 至今，新增 26 个附件
-- 开源整理：补 README / LICENSE / .gitattributes / CHANGELOG
+- 开源整理：补 README / LICENSE / .gitattributes / CHANGELOG / 展示截图
 
 ## 2026-11-01
 

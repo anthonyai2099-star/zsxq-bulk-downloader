@@ -1,10 +1,10 @@
-# 把工作区里导出的文件搬到 D 盘长期目录，并合并清单。
+﻿# 把工作区里导出的文件搬到 D 盘长期目录，并合并清单。
 # 用法：pwsh -File scripts\sync-to-d.ps1
-#      pwsh -File scripts\sync-to-d.ps1 -Source "D:\...\_exports\zsxq\系统技术" -Target "D:\知识星球下载\系统技术"
+#      pwsh -File scripts\sync-to-d.ps1 -Source "D:\zsxq-downloads\_staging\系统技术" -Target "D:\zsxq-library\系统技术"
 
 param(
-    [string]$Source = "D:\CLAUDE-CODE\Text\_exports\zsxq\系统技术",
-    [string]$Target = "D:\知识星球下载\系统技术"
+    [string]$Source = "D:\zsxq-downloads\_staging\系统技术",
+    [string]$Target = "D:\zsxq-library\系统技术"
 )
 
 $ErrorActionPreference = "Stop"

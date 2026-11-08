@@ -5,6 +5,7 @@ __pycache__/
 *.pyc
 downloads/
 .tmp/
+*.log
 pip-install*.log
-downloads/
-
+.DS_Store
+Thumbs.db

@@ -1,175 +1,148 @@
-# tools-zsxq-pdf-downloader
+# 知识星球批量下载工作
 
-把 [zsxq-pdf-downloader 技能](https://github.com/silentdog918/zsxq-pdf-downloader-skill) 改造成本机可直接运行的版本：用 Playwright 驱动本机浏览器，登录一次知识星球后，按群组 + 日期范围批量下载帖子里的附件（默认 PDF）。
+> `zsxq-bulk-downloader` —— 把一个知识星球（zsxq.com）里的附件，按「一篇帖子一个文件夹」批量归档到本地。
 
-原技能依赖 Claude in Chrome 扩展提供的 `tabs_context_mcp` / `javascript_tool` / `read_page` 等 MCP 工具，本机没有这些工具，因此这里只保留它的**流程知识**（见 [docs/original-skill.md](docs/original-skill.md)），执行层换成本地浏览器自动化。
+知识星球网页端没有批量导出功能，App 里也只能一条条点。这个项目用 Playwright 驱动本机浏览器、模拟真人操作，把一个星球的历史附件按帖子整理成本地资料库，适合做个人知识库归档。
 
-## 技术栈
+## 特性
 
-- Python 3.12 + Playwright（同步 API）
-- 浏览器：本机 Microsoft Edge（`channel="msedge"`），失败自动回退 Chromium
-- 独立浏览器 profile：`.browser-profile/`，登录态本地保存，不进 git
+- **一篇帖子一个文件夹**：文件夹名 `日期_标题`，该帖所有附件落在里面，另附 `_manifest.json` 清单
+- **按时间范围筛选**：`--days` / `--since` / `--until`，可按月切片跑
+- **按主题筛选**：关键字只匹配标题，避免正文随口提一句就被算进来
+- **增量补漏**：已下载的文件按「文件夹 + 文件名」自动跳过，扩大范围不会重复下载
+- **断点续跑**：失败项回到队列重试；页面「点不动」时自动重启浏览器会话
+- **内容保护识别**：群主开启「仅 App 可下载」时弹窗里没有下载按钮，脚本识别并跳过，不绕过
+
+## 和其他方案的区别
+
+- **不走 API**：zsxq 官方对非官方工具直接返回 `code 1059`（"不支持非官方工具访问"），所以只保留浏览器点击这一条路。
+- **不依赖 Claude in Chrome**：原始思路来自 [zsxq-pdf-downloader-skill](https://github.com/silentdog918/zsxq-pdf-downloader-skill)，那套依赖 MCP 工具；这里用 Playwright 落到本机，不需要任何扩展。
+
+## 环境要求
+
+- Windows 10/11
+- Python 3.10+
+- Microsoft Edge（系统自带即可，不需要装 Chromium）
 
 ## 安装
 
 ```powershell
+git clone https://github.com/<your-name>/zsxq-bulk-downloader.git
+cd zsxq-bulk-downloader
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-## 使用
-
-**登录一次 → 确认群组 → 试跑 → 正式下载**。
+## 快速开始
 
 ```powershell
-# 1. 登录：弹出浏览器，微信扫码；登录态写入 .browser-profile（之后不用再扫）
+# 1. 登录：弹出浏览器，微信扫码；登录态存到 .browser-profile，之后不用再扫
 .\.venv\Scripts\python.exe src\zsxq_dl.py login
 
-# 2. 看自己加入了哪些群组（带 group_id）
+# 2. 看自己加入了哪些星球（带 group_id）
 .\.venv\Scripts\python.exe src\zsxq_dl.py groups
 
-# 3. 试跑：只列出识别到的附件，不下载
-.\.venv\Scripts\python.exe src\zsxq_dl.py dry-run --group "系统技术" --days 7
+# 3. 先搜：只列清单，不下载
+.\.venv\Scripts\python.exe src\zsxq_dl.py search --group "系统技术" --days 90 --title-only
 
-# 4. 正式下载
-.\.venv\Scripts\python.exe src\zsxq_dl.py download --group "系统技术" --days 7 --out "$HOME\Downloads\zsxq"
+# 4. 导出：一篇帖子一个文件夹
+.\.venv\Scripts\python.exe src\zsxq_dl.py export --group "系统技术" --days 30 --out .\downloads
 ```
+
+## 输出结构
+
+```
+downloads/系统技术/
+├── 2026-10-26_美日利剑27联合实兵演习作战体系与战术演进解析/
+│   ├── 美日利剑27演习MATLAB仿真技术报告.docx
+│   ├── 利剑27演习MATLAB仿真源码.zip
+│   └── ...            # 该帖全部附件
+├── 2026-10-25_俄罗斯菲林喷气推进巡航导弹技术特征解析/
+└── _manifest.json     # 每个附件的记录：所属文件夹、文件名、大小
+```
+
+## 命令一览
+
+| 命令 | 作用 |
+| --- | --- |
+| `login` | 打开浏览器扫码登录，登录态持久化 |
+| `groups` | 列出已加入的星球名和 `group_id` |
+| `search` | 按时间/关键词搜帖子，只输出清单 |
+| `dry-run` | 列出识别到的附件，不点击 |
+| `export` | 按帖子导出附件（主命令） |
+| `download` | 不分文件夹，平铺下载匹配的附件 |
 
 常用参数：
 
 | 参数 | 说明 |
 | --- | --- |
-| `--group` | 群组名模糊匹配，自动解析成 id 后跳转 |
-| `--group-id` | 群组 id（`groups` 命令能看到），最稳 |
-| `--group-url` | 群组完整链接 |
-| `--days N` | 只处理最近 N 天（默认 7） |
-| `--since YYYY-MM-DD` | 指定起始日期，优先于 `--days` |
-| `--ext pdf` | 附件类型，逗号分隔，如 `pdf,docx` |
-| `--out DIR` | 下载目录，默认 `downloads/`（见下方说明） |
-| `--limit N` | 本次最多成功下载几个，调试用 |
-| `--force` | 同名文件已存在也重新下 |
-| `--headless` | 无头模式（看不到浏览器窗口） |
-
-## 按帖子导出（一篇一个文件夹）
-
-`export` 子命令会按帖子建文件夹，把该帖所有附件放进去，不写正文：
-
-```powershell
-.\.venv\Scripts\python.exe src\zsxq_dl.py export --group "系统技术" --days 30 --folder-name "系统技术"
-```
-
-产出结构：
-
-```
-downloads/系统技术/
-├── 2026-10-26_美日“利剑27”联合实兵演习…/
-│   ├── 美日利剑27演习…仿真技术报告.docx
-│   └── …（该帖全部附件）
-├── 2026-10-25_俄罗斯“菲林”喷气推进巡航导弹…/
-└── _manifest.json          # 每个附件的状态：downloaded / skipped / failed
-```
-
-导出专用参数：
-
-| 参数 | 说明 |
-| --- | --- |
-| `--folder-name` | 群组子目录名，默认用 `--group` 的值 |
-| `--ext *` | 附件类型过滤，默认全部 |
-| `--batch N` | 每尝试 N 个文件重启一次浏览器会话（默认 3） |
-| `--retries N` | 单个文件最多重试次数（默认 2） |
-| `--delay` | 每个文件之间的间隔秒数 |
-| `--out DIR` | 根目录，默认 `downloads/` |
-| `--existing DIR` | 已下载目录，命中同名文件就跳过（可重复，增量补跑用） |
-| `--match k1,k2` | 只下载标题/正文命中关键字的帖子（逗号分隔，默认任一命中） |
-| `--match-all` | 要求全部关键字命中 |
-| `--title-only` | 只匹配标题，避免正文随口提一句也被算进来 |
+| `--group` / `--group-id` / `--group-url` | 目标星球，`group-id` 最稳 |
+| `--days N` / `--since` / `--until` | 时间范围，`--since/--until` 优先 |
+| `--title-only` | 只匹配标题（推荐） |
+| `--match k1,k2` | 临时关键词，和 `--profile` 合并 |
+| `--profile topics.json` | 偏好关键字文件（默认读取项目内 topics.json） |
+| `--only macro,uav` | 只启用偏好文件里的某几组 |
 | `--skip k1,k2` | 标题含这些词的帖子跳过 |
+| `--existing DIR` | 已下载目录，命中同名文件就跳过（可重复） |
+| `--out DIR` | 输出根目录 |
+| `--batch N` | 每尝试 N 个文件重启一次浏览器会话（默认 3） |
+| `--retries N` | 单个文件最多重试次数 |
+| `--delay` | 每个文件之间的间隔秒数 |
+| `--headless` | 无头模式，不弹窗口 |
 
-## 按兴趣筛选下载
+## 偏好配置
 
-内容太多时先搜后下，`search` 只扫描不下载：
+`topics.json` 里按主题分组维护关键词，`macro` 组标了 `priority: high`：
 
-```powershell
-# 90 天里标题含「无人机 / 防空 / 航母」的帖子，只列清单
-.\.venv\Scripts\python.exe src\zsxq_dl.py search --group "系统技术" --days 90 `
-  --match "无人机,防空,航母" --title-only --out search.json
-
-# 确认后只下这些主题
-.\.venv\Scripts\python.exe src\zsxq_dl.py export --group "系统技术" --days 90 `
-  --match "无人机,防空,航母" --title-only `
-  --out "D:\CLAUDE-CODE\Text\_exports\zsxq" --existing "D:\知识星球下载\系统技术"
+```json
+{
+  "default": ["macro", "uav", "air", "sea", "precision"],
+  "groups": {
+    "macro": { "label": "宏观战略 / 战法", "priority": "high", "keywords": ["演习", "战争", "战略", "杀伤链"] },
+    "uav":   { "label": "反无人机", "keywords": ["无人机", "反无人", "蜂群"] }
+  }
+}
 ```
 
-`search` 的输出是 `日期 | 附件数 | 标题`，可以直接挑；要排除某几篇就用 `--skip` 传标题里的特征词。
+`search` 和 `export` 默认就吃这套配置，也可以 `--only macro,air` 临时收窄。`preferences.md` 写了这套配置背后的取舍逻辑。
 
-## 偏好（长期有效）
+## 增量补漏
 
-**先读 [preferences.md](preferences.md)**：宏观战略 / 战法 / 作战概念优先级最高，不能以「偏战略、和装备无关」为由排除；其次是成体系的装备技术。
-
-关键字集合在 [topics.json](topics.json)，分组维护（`macro` 组标了 `priority: high`）。筛帖时直接吃这套配置：
+隔一段时间想补新的，把范围开到上次之前，已下载的会自动跳过：
 
 ```powershell
-# 用默认偏好（宏观 + 反无人机 + 空中 + 海上 + 精确打击）
-.\.venv\Scripts\python.exe src\zsxq_dl.py search --group "系统技术" --days 90 --title-only
-
-# 只启用其中几组
-.\.venv\Scripts\python.exe src\zsxq_dl.py search --group "系统技术" --days 90 --title-only --only macro,uav
-```
-
-`--match` 的临时关键字会和 `--profile` 合并去重，所以「固定偏好 + 临时加词」可以一起用。
-
-## 长期存放与增量下载（重要约定）
-
-**长期库固定在 `D:\知识星球下载\<群组名>\`**，这是唯一需要备份的地方。
-
-Python 子进程被沙箱限制只能写工作区，写 `D:\知识星球下载` 会 `PermissionError`，所以流程是「先落暂存区，再搬过去」：
-
-```powershell
-# 1. 导出到工作区暂存区，同时告诉它去哪儿找已下载的文件
 .\.venv\Scripts\python.exe src\zsxq_dl.py export `
-  --group "系统技术" --days 30 --folder-name "系统技术" `
-  --out "D:\CLAUDE-CODE\Text\_exports\zsxq" `
-  --existing "D:\知识星球下载\系统技术"
-
-# 2. 搬到 D 盘长期库，并合并清单
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\sync-to-d.ps1
+  --group-id 12345678901234 `
+  --since 2026-09-01 `
+  --title-only `
+  --existing "D:\zsxq-library\系统技术"
 ```
 
-> 本机执行策略禁止直接运行 .ps1，必须带 `-ExecutionPolicy Bypass`；`pwsh` 也不在 PATH 里，用 `powershell`。
+## 实现要点（踩过的坑）
 
-**增量规则**：任何时候要更大范围（比如这次 30 天、下次 60 天），都只要把 `--days` 改大、`--existing` 指向长期库即可，已经下过的文件按「帖子文件夹 + 文件名」自动跳过，不会重复下载。
+1. **信息流加载慢**：每批 20 篇要 5–10 秒，等待不足会被误判「没有更多」，只能加载到 20 篇。现在用真实滚轮事件 + 4 秒等待 + 停滞 5 批才停。
+2. **一次加载太多会失败**：90 天 ≈ 120 篇尚可，再往前（300+ 篇）会加载不全。按 `--since/--until` 分月切片最稳。
+3. **同一会话连点 3–4 个附件后会「点不动」**：弹窗遮罩残留导致，`--batch` 定期重启会话 + 失败回队列。
+4. **下载后弹窗不会自己关**：Escape 也失效（焦点被下载抢走），必须点遮罩容器关闭。
+5. **同名帖子**：同一天可能重发同名帖（附件不同），定位附件必须「日期 + 标题 + 文件名」三者一起匹配。
+6. **切群组必须走 URL**：点侧栏群组名只改 SPA 路由，信息流不刷新，附件数会读成 0。
+7. **网络抖动**：DNS 失败、Edge 偶发启动失败都会中断整批，会话启动带 10 次退避重试 + profile 锁清理。
 
-> 路径别名：暂存区 `D:\CLAUDE-CODE\Text\_exports\zsxq\<群组>`、长期库 `D:\知识星球下载\<群组>`。别把 C 盘的临时副本当作库，C 盘那份只是给用户看一眼的拷贝。
+## 目录结构
 
-## 真实页面结构（2026-10 校准）
-
-| 元素 | 选择器 |
-| --- | --- |
-| 附件卡片 | `div.file-name`（文字即文件名，点击弹出「文件详情」） |
-| 下载按钮 | `div.btn.download`（弹窗内，文字「下载文件」） |
-| 群组侧栏 | `span.group-name`，外层 `<a href="/group/{id}">` |
-| 帖子时间 | `2026-10-26 07:22` |
-
-三个实测坑：
-
-1. **切换群组必须走 URL**。点侧栏群组名只改 SPA 路由，信息流不刷新，附件数会读成 0；必须解析出 group_id 后 `goto` 群组页。
-2. **不能走 API**。`api.zsxq.com` 对非官方工具返回 `code 1059`（"不支持非官方工具访问"），只保留浏览器模拟点击这条路。
-3. **弹窗不会自己关**。下载完成后「文件详情」弹窗仍在，遮罩会挡住后续点击；Escape 也无效（焦点被下载抢走），必须点遮罩容器关闭。另外同一会话连点三四次后页面会「点不动」，所以按 `--batch` 重启会话，失败项回队列重试。
-
-## 识别不准怎么办
-
-页面改版会导致附件卡片或下载按钮定位失败。先导出真实结构：
-
-```powershell
-.\.venv\Scripts\python.exe src\zsxq_dl.py probe --group "系统技术" --scroll 3
-# 产出 probe/page.html、probe/probe.json、probe/screen.png
 ```
-
-然后对照 `probe.json`，调整 `src/zsxq_dl.py` 顶部的 `FILE_SELECTOR` / `DOWNLOAD_SELECTOR`。
+src/zsxq_dl.py          主程序（CLI + Playwright 流程）
+scripts/sync-to-d.ps1   把暂存区文件搬到长期库并合并清单（可选）
+tests/fixture.html      模拟知识星球 DOM 的离线页面
+tests/smoke.py          离线自检
+topics.json             偏好关键词
+preferences.md          偏好取舍说明
+docs/original-skill.md  原始 skill 存档（流程参考）
+```
 
 ## 离线自检
 
-不需要登录，用本地 fixture 页面验证「识别 → 点击 → 弹窗 → 下载 → 落盘 → 内容保护」全链路：
+不需要账号，用本地 fixture 验证「识别 → 点击 → 弹窗 → 下载 → 落盘 → 内容保护」全链路：
 
 ```powershell
 .\.venv\Scripts\python.exe tests\smoke.py
@@ -177,30 +150,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\sync-to-d.ps1
 
 ## 已知限制
 
-- **内容保护**：群主开启「仅 App 可下载」时弹窗里没有下载按钮，脚本识别并跳过，不尝试绕过。
-- **日期只按页面上的时间标签估算**：用来决定何时停止滚动，不是精确过滤；`dry-run` 会输出页面日期范围供核对。
-- **需人工登录**：不处理账号密码，二维码要在浏览器里手动扫；登录态有效期由知识星球决定，过期后重跑 `login` 即可。
-- **同名文件默认跳过**，不会产生 `(1)(2)` 垃圾文件；`--force` 可覆盖。
-- 下载的是你自己账号有权限的内容，脚本只做批量点击，不绕过任何权限或保护。
+- 仅在 Windows + Edge 上验证，其他平台需要改浏览器 channel 和 `.ps1` 脚本
+- 登录必须人工扫码，脚本不处理账号密码
+- 知识星球页面改版后需要跑 `probe` 重新校准选择器
+- 大范围回溯很慢：300 篇的加载深度下，单次会话光滚动就要 5–10 分钟
 
-## 部署 / 发布
+## 免责声明
 
-本机工具，不发布。拷贝整个目录（不含 `.venv`、`.browser-profile`、`.tmp`、`probe`）即可在另一台机器复现。
+本项目仅用于批量下载**你自己有权访问**的内容，方便个人离线归档。请遵守知识星球的用户协议与内容保护设置，不要把下载到的付费内容二次传播。使用本工具产生的一切后果由使用者自行承担。
 
-## 状态（2026-11-01）
+## License
 
-- 登录态持久化有效，重启浏览器不用重扫
-- **长期库：`D:\知识星球下载\系统技术\`，193 篇帖子 / 739 个附件 / 1.24 GB，覆盖 2026-01 ~ 2026-10 全年**
-  - 按月：1 月 18 篇、2 月 14 篇、3 月 26 篇、4 月 14 篇、5 月 22 篇、6 月 16 篇、7 月 14 篇、8 月 15 篇、9 月 23 篇、10 月 31 篇
-  - 筛选口径：`topics.json` 默认五组（宏观战法、反无人机、空中力量、海上力量、精确打击），只匹配标题
-- 全部 739 个附件通过文件头校验，无 0 字节、无损坏、无空目录
-- `_manifest.json` 739 条，按实际磁盘内容重建
-- 离线自检 3/3 通过
-
-## 批量下载的已知坑（2026-10-30 补）
-
-1. **信息流加载慢**：每批 20 篇要 5–10 秒，等待不足会被误判「没有更多」，导致只加载 20 篇。
-2. **一次加载 90 天（120 篇）容易失败**：改成按 `--since/--until` 分两段跑，每段约 40–80 篇。
-3. **同一会话连点 3–4 个附件后会「点不动」**：靠 `--batch` 定期重启会话 + 失败回队列重试。
-4. **同名帖子**（同一天重发、附件不同）：定位附件必须「日期 + 标题 + 文件名」三者一起匹配。
-5. **网络抖动**（DNS 解析失败、Edge 偶发启动失败）：会话启动带 8 次退避重试。
+[MIT](LICENSE)

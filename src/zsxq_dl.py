@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """知识星球附件批量下载器（Playwright 本地版）。
 
 把 zsxq-pdf-downloader 技能的流程，从「Claude in Chrome 扩展手动点」改成本机脚本：
@@ -35,15 +35,26 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:  # noqa: BLE001
         pass
 
+# 必须在 Playwright 启动 driver 之前把 TEMP 指到可写目录：
+# 某些受限环境（沙箱 / 只读临时目录）下 driver 建临时目录会 EPERM。
+_ROOT = Path(__file__).resolve().parent.parent
+_TMP = _ROOT / ".tmp"
+try:
+    _TMP.mkdir(parents=True, exist_ok=True)
+    os.environ["TEMP"] = str(_TMP)
+    os.environ["TMP"] = str(_TMP)
+except OSError:
+    pass
+
 from playwright.sync_api import BrowserContext, Error as PWError, Page
 from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = _ROOT
 PROFILE_DIR = ROOT / ".browser-profile"
 PROBE_DIR = ROOT / "probe"
-TMP_DIR = ROOT / ".tmp"
-DEFAULT_OUT = ROOT / "downloads"  # 本机沙箱只允许子进程写工作区，先落这里再搬出去
+TMP_DIR = _TMP
+DEFAULT_OUT = ROOT / "downloads"
 HOME_URL = "https://wx.zsxq.com/"
 GROUP_URL = "https://wx.zsxq.com/group/{gid}"
 
